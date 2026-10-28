@@ -342,7 +342,7 @@ export default function (pi: ExtensionAPI) {
 	 */
 	const routeStatus = (ctx: ExtensionContext): string | undefined => {
 		const model = ctx.model;
-		if (!model || model.provider !== "openrouter") return undefined;
+		if (model?.provider !== "openrouter") return undefined;
 		const binding = bindingFor(agentDir, model);
 		const { pin, sessionScoped } = resolvePin(agentDir, model);
 		const shed = fallbackStatus(ctx);
@@ -558,7 +558,7 @@ export default function (pi: ExtensionAPI) {
 		inFlight = undefined;
 		inFlightFlex = undefined;
 		const model = ctx.model;
-		if (!model || model.provider !== "openrouter") return;
+		if (model?.provider !== "openrouter") return;
 
 		const payload = event.payload;
 		if (!isRecord(payload)) return;
@@ -697,7 +697,7 @@ export default function (pi: ExtensionAPI) {
 	/** Flex capacity is not prioritised for warming, and most flex endpoints do not cache. */
 	pi.on("cache_warming_decision", (_event, ctx) => {
 		const model = ctx.model;
-		if (!model || model.provider !== "openrouter") return;
+		if (model?.provider !== "openrouter") return;
 		if (bindingFor(agentDir, model)?.flex) return { action: "stop" as const };
 		return;
 	});
@@ -814,7 +814,7 @@ export default function (pi: ExtensionAPI) {
 		const targets: { provider: string; id: string; baseUrl?: string }[] = [];
 		const add = (model: { provider: string; id: string; baseUrl?: string } | undefined): void => {
 			// Thinking-level variants (`model:high`) share one endpoint list; keep the first full id.
-			if (!model || model.provider !== "openrouter" || seen.has(modelSlug(model.id))) return;
+			if (model?.provider !== "openrouter" || seen.has(modelSlug(model.id))) return;
 			seen.add(modelSlug(model.id));
 			targets.push(model);
 		};

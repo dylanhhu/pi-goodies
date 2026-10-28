@@ -167,7 +167,7 @@ export default function (pi: ExtensionAPI) {
 						break;
 					}
 				}
-				if (!lastUser || lastUser.type !== "message" || lastUser.message.role !== "user") {
+				if (lastUser?.type !== "message" || lastUser.message.role !== "user") {
 					ctx.ui.notify("No user message to retry", "warning");
 					return;
 				}
