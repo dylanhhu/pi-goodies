@@ -10,6 +10,13 @@
  *   route is preferred, ordered through the pin when one is active.
  */
 
+import {
+	cheapestFlexSibling,
+	flexEndpoints,
+	providerSlugOf,
+	siblingOfTag,
+	standardSiblingTag,
+} from "./catalog.ts";
 import type {
 	Endpoint,
 	FallbackRouting,
@@ -18,13 +25,6 @@ import type {
 	PinBinding,
 	PlannedRoute,
 } from "./types.ts";
-import {
-	cheapestFlexSibling,
-	flexEndpoints,
-	providerSlugOf,
-	siblingOfTag,
-	standardSiblingTag,
-} from "./catalog.ts";
 
 export interface RouteInputs {
 	binding?: ModelBinding;
@@ -103,7 +103,8 @@ function planShed(
 	if (!sibling) return { shed: true, provider: pinRouting(pin) };
 
 	// An endpoint pin keeps the provider affinity the endpoint itself expressed.
-	if (!flex || flex.endpoint) return { shed: true, provider: { order: [sibling], allow_fallbacks: true } };
+	if (!flex || flex.endpoint)
+		return { shed: true, provider: { order: [sibling], allow_fallbacks: true } };
 	if (pin) return { shed: true, provider: siblingFirst(pin, sibling) };
 	return { shed: true, provider: { order: [sibling], allow_fallbacks: true } };
 }

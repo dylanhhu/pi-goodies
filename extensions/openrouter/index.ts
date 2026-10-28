@@ -61,10 +61,12 @@ import {
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
-	type MessageEndEventResult,
 	getAgentDir,
+	type MessageEndEventResult,
 } from "@earendil-works/pi-coding-agent";
+import { assessFlex, type FlexAdvice } from "./advisor.ts";
 import {
+	blendNote,
 	cachedEndpoints,
 	catalogCost,
 	cheapestFlexSibling,
@@ -79,17 +81,17 @@ import {
 	formatUsd,
 	isRecord,
 	modelSlug,
-	providersOf,
 	providerRouting,
+	providersOf,
 	ratePerToken,
+	ratesCell,
 	referencePrice,
-	standardSiblingTag,
 	siblingOfTag,
+	standardSiblingTag,
 	turnMixNote,
 	versusLabel,
-	blendNote,
-	ratesCell,
 } from "./catalog.ts";
+import { effectiveFlexEndpoint, planRoute } from "./route.ts";
 import {
 	bindingFor,
 	bindingKey,
@@ -97,20 +99,18 @@ import {
 	deleteSessionPin,
 	describeFallbackRouting,
 	fallbackRouting,
+	loadState,
 	putSessionPin,
 	resolvePin,
 	resolveTurnMix,
 	restoreSessionPins,
-	loadState,
+	SESSION_ENTRY_TYPE,
+	STATE_FILE,
+	sessionPinState,
 	setFallbackRouting,
 	setFlexBinding,
 	setPinBinding,
-	sessionPinState,
-	SESSION_ENTRY_TYPE,
-	STATE_FILE,
 } from "./state.ts";
-import { effectiveFlexEndpoint, planRoute } from "./route.ts";
-import { assessFlex, type FlexAdvice } from "./advisor.ts";
 import type {
 	Endpoint,
 	EndpointPricing,
@@ -238,7 +238,8 @@ function describePin(model: { id: string }, pin: PinBinding, sessionScoped = fal
 }
 
 function describeBinding(model: { id: string }, binding: FlexBinding): string {
-	if (!binding.endpoint) return `Flex auto for ${model.id}: cheapest flex endpoint serves each request`;
+	if (!binding.endpoint)
+		return `Flex auto for ${model.id}: cheapest flex endpoint serves each request`;
 	const pricing = binding.pricing;
 	if (!pricing) return `Flex pinned to ${binding.endpoint} for ${model.id}`;
 	return `Flex pinned to ${binding.endpoint} for ${model.id}: ${formatPerMillion(ratePerToken(pricing.prompt))} in / ${formatPerMillion(ratePerToken(pricing.completion))} out per Mtok`;
@@ -261,7 +262,8 @@ function endpointLabel(
 	details.push(...flexComparisons(endpoint, allEndpoints, reference, mix));
 	const context = formatContext(endpoint.context_length);
 	if (context) details.push(context);
-	if (typeof endpoint.uptime_last_30m === "number") details.push(`${endpoint.uptime_last_30m.toFixed(1)}% up`);
+	if (typeof endpoint.uptime_last_30m === "number")
+		details.push(`${endpoint.uptime_last_30m.toFixed(1)}% up`);
 	return `${selected ? "▶" : " "} ${endpoint.tag} · ${details.join(" · ")}`;
 }
 
@@ -348,9 +350,12 @@ export default function (pi: ExtensionAPI) {
 		// The planner activates the pin during an `openrouter` cooldown, since no provider
 		// affinity is imposed and the pin remains the only constraint. Everywhere else an
 		// endpoint pin owns the route and the pin is dormant.
-		const pinActive = !endpointPinned || (Boolean(shed) && fallbackRouting(agentDir) === "openrouter");
+		const pinActive =
+			!endpointPinned || (Boolean(shed) && fallbackRouting(agentDir) === "openrouter");
 		const notOptimal = !shed && advice.get(bindingKey(model))?.notOptimal ? " (not optimal)" : "";
-		const pinText = pin ? ` · pin: ${pinSuffix(pin, sessionScoped)}${pinActive ? "" : " (pin inactive)"}` : "";
+		const pinText = pin
+			? ` · pin: ${pinSuffix(pin, sessionScoped)}${pinActive ? "" : " (pin inactive)"}`
+			: "";
 		if (shed) return `${shed}${pinText}`;
 		if (!binding?.flex) {
 			if (!pin) return undefined;
@@ -390,7 +395,11 @@ export default function (pi: ExtensionAPI) {
 	 * Store the advisor's comparison for a model and, once per session, warn when standard
 	 * routing is cheaper. The comparison itself is pure; this handles caching and notice.
 	 */
-	const recordAdvice = (ctx: ExtensionContext, model: ModelLike, endpoints: readonly Endpoint[]): void => {
+	const recordAdvice = (
+		ctx: ExtensionContext,
+		model: ModelLike,
+		endpoints: readonly Endpoint[],
+	): void => {
 		const key = bindingKey(model);
 		const binding = bindingFor(agentDir, model);
 		if (!binding?.flex) {
@@ -458,7 +467,10 @@ export default function (pi: ExtensionAPI) {
 	 * cheapest flex endpoint permitted by the pin, since that endpoint is the one flex
 	 * routing would have preferred and so the provider most likely holding the cache.
 	 */
-	const standardFallbackEndpoint = async (ctx: ExtensionContext, modelId: string): Promise<string | undefined> => {
+	const standardFallbackEndpoint = async (
+		ctx: ExtensionContext,
+		modelId: string,
+	): Promise<string | undefined> => {
 		if (fallbackRouting(agentDir) === "openrouter") return undefined;
 		const model: ModelLike = { provider: "openrouter", id: modelId };
 		const flex = bindingFor(agentDir, model)?.flex;
@@ -613,7 +625,13 @@ export default function (pi: ExtensionAPI) {
 				output: number;
 				cacheRead: number;
 				cacheWrite: number;
-				cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+				cost: {
+					input: number;
+					output: number;
+					cacheRead: number;
+					cacheWrite: number;
+					total: number;
+				};
 			};
 		};
 		const pending = inFlight;
@@ -642,7 +660,9 @@ export default function (pi: ExtensionAPI) {
 				// Pi's own retry would back off first; relabel the attempt and continue it
 				// at standard rates at the settle boundary instead.
 				pendingContinuation = { at: Date.now(), errorText: FALLBACK_STOP_MESSAGE };
-				return { message: { ...message, errorMessage: FALLBACK_STOP_MESSAGE } } as unknown as MessageEndEventResult;
+				return {
+					message: { ...message, errorMessage: FALLBACK_STOP_MESSAGE },
+				} as unknown as MessageEndEventResult;
 			}
 			return;
 		}
@@ -765,7 +785,9 @@ export default function (pi: ExtensionAPI) {
 		const cheapest = flex[0];
 		const autoSelected = Boolean(current && !current.endpoint);
 		const autoPrice = `${formatPerMillion(ratePerToken(cheapest.pricing?.prompt))}/${formatPerMillion(ratePerToken(cheapest.pricing?.completion))}`;
-		options.push(`${autoSelected ? "▶" : " "} flex auto · from ${autoPrice} per Mtok · cheapest flex endpoint wins`);
+		options.push(
+			`${autoSelected ? "▶" : " "} flex auto · from ${autoPrice} per Mtok · cheapest flex endpoint wins`,
+		);
 		targets.push({ endpoint: null, updatedAt: Date.now() });
 
 		for (const endpoint of flex) {
@@ -829,7 +851,10 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		if (targets.length === 1 && !ctx.scopedModels.some((scoped) => scoped.model.provider === "openrouter")) {
+		if (
+			targets.length === 1 &&
+			!ctx.scopedModels.some((scoped) => scoped.model.provider === "openrouter")
+		) {
 			ctx.ui.notify("No scoped models configured; scanning the current model only", "info");
 		}
 
@@ -896,13 +921,23 @@ export default function (pi: ExtensionAPI) {
 				formatUsd(endpointTurnCost(row.flex[0], row.turn.mix)) +
 				(row.flex.length > 1 ? ` (${row.flex.length} flex)` : ""),
 			rates: ratesCell(row.flex[0].pricing),
-			comp: flexComparisons(row.flex[0], row.endpoints, row.reference, row.turn.mix).join(" · ") || "—",
+			comp:
+				flexComparisons(row.flex[0], row.endpoints, row.reference, row.turn.mix).join(" · ") || "—",
 		}));
 		const widthOf = (header: string, values: readonly string[]): number =>
 			Math.max(header.length, ...values.map((value) => value.length));
-		const modelWidth = widthOf("MODEL", cells.map((cell) => cell.model));
-		const priceWidth = widthOf("FLEX $/TURN", cells.map((cell) => cell.price));
-		const ratesWidth = widthOf("IN/OUT/CR $/MTOK", cells.map((cell) => cell.rates));
+		const modelWidth = widthOf(
+			"MODEL",
+			cells.map((cell) => cell.model),
+		);
+		const priceWidth = widthOf(
+			"FLEX $/TURN",
+			cells.map((cell) => cell.price),
+		);
+		const ratesWidth = widthOf(
+			"IN/OUT/CR $/MTOK",
+			cells.map((cell) => cell.rates),
+		);
 		const lines = [
 			`${pad("MODEL", modelWidth)}  ${pad("FLEX $/TURN", priceWidth)}  ${pad("IN/OUT/CR $/MTOK", ratesWidth)}  COMPARISONS (cheapest baseline first)`,
 		];
@@ -922,7 +957,9 @@ export default function (pi: ExtensionAPI) {
 			const unresolved = row.slug.startsWith("~");
 			return `· ${id}${resolved} — OpenRouter lists no endpoints${unresolved ? " (an unrecognized Pi latest-alias; use the concrete model id)" : ""}`;
 		}
-		const tiers = [...new Set(row.endpoints.map((endpoint) => endpoint.service_tier ?? "default"))].sort();
+		const tiers = [
+			...new Set(row.endpoints.map((endpoint) => endpoint.service_tier ?? "default")),
+		].sort();
 		return `· ${id}${resolved} — no flex endpoint (tiers: ${tiers.join(", ")})`;
 	};
 
@@ -943,9 +980,21 @@ export default function (pi: ExtensionAPI) {
 				{ value: "on", label: "on", description: "Request flex, no endpoint pin" },
 				{ value: "off", label: "off", description: "Standard routing" },
 				{ value: "mix", label: "mix", description: "Show or refresh the blend weights" },
-				{ value: "fallback", label: "fallback", description: "Show where a shed request is served" },
-				{ value: "fallback same-provider", label: "fallback same-provider", description: "Standard sibling of the same provider, cache warm" },
-				{ value: "fallback openrouter", label: "fallback openrouter", description: "OpenRouter default routing during the cooldown" },
+				{
+					value: "fallback",
+					label: "fallback",
+					description: "Show where a shed request is served",
+				},
+				{
+					value: "fallback same-provider",
+					label: "fallback same-provider",
+					description: "Standard sibling of the same provider, cache warm",
+				},
+				{
+					value: "fallback openrouter",
+					label: "fallback openrouter",
+					description: "OpenRouter default routing during the cooldown",
+				},
 				{ value: "scan", label: "scan", description: "Check all scoped models for flex endpoints" },
 				{ value: "status", label: "status", description: "Show the current binding" },
 				{ value: "refresh", label: "refresh", description: "Drop the endpoint cache" },
@@ -981,12 +1030,23 @@ export default function (pi: ExtensionAPI) {
 			if (args === "fallback" || args.startsWith("fallback ")) {
 				const wanted = args.slice("fallback".length).trim();
 				if (wanted === "") {
-					ctx.ui.notify(`Flex fallback routing: ${describeFallbackRouting(fallbackRouting(agentDir))}`, "info");
+					ctx.ui.notify(
+						`Flex fallback routing: ${describeFallbackRouting(fallbackRouting(agentDir))}`,
+						"info",
+					);
 					return;
 				}
-				const routing = wanted === "openrouter" ? "openrouter" : wanted === "same-provider" ? "same-provider" : undefined;
+				const routing =
+					wanted === "openrouter"
+						? "openrouter"
+						: wanted === "same-provider"
+							? "same-provider"
+							: undefined;
 				if (!routing) {
-					ctx.ui.notify(`Unknown fallback routing \`${wanted}\`. Use \`same-provider\` or \`openrouter\`.`, "error");
+					ctx.ui.notify(
+						`Unknown fallback routing \`${wanted}\`. Use \`same-provider\` or \`openrouter\`.`,
+						"error",
+					);
 					return;
 				}
 				setFallbackRouting(agentDir, routing);
@@ -1000,7 +1060,10 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (model.provider !== "openrouter") {
-				ctx.ui.notify(`/flex applies to OpenRouter models only (current: ${model.provider}/${model.id})`, "warning");
+				ctx.ui.notify(
+					`/flex applies to OpenRouter models only (current: ${model.provider}/${model.id})`,
+					"warning",
+				);
 				return;
 			}
 
@@ -1022,7 +1085,9 @@ export default function (pi: ExtensionAPI) {
 				else lines.push(describeBinding(model, binding));
 				if (pin) {
 					const inactive = Boolean(binding?.endpoint);
-					lines.push(`${describePin(model, pin, sessionScoped)}${inactive ? " — inactive while an endpoint is pinned" : ""}`);
+					lines.push(
+						`${describePin(model, pin, sessionScoped)}${inactive ? " — inactive while an endpoint is pinned" : ""}`,
+					);
 				} else {
 					lines.push("Provider routing: OpenRouter default (no pin)");
 				}
@@ -1036,7 +1101,9 @@ export default function (pi: ExtensionAPI) {
 				if (fallback && Date.now() < fallback.until) {
 					const seconds = Math.ceil((fallback.until - Date.now()) / 1000);
 					const via = fallback.endpoint ?? "OpenRouter default routing";
-					lines.push(`Falling back to standard rates for ${seconds}s via ${via}, then retrying flex: ${fallback.reason}`);
+					lines.push(
+						`Falling back to standard rates for ${seconds}s via ${via}, then retrying flex: ${fallback.reason}`,
+					);
 				}
 				lines.push(`Fallback routing: ${describeFallbackRouting(fallbackRouting(agentDir))}`);
 				ctx.ui.notify(lines.join("\n"), "info");
@@ -1049,7 +1116,9 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const { endpoints, error, slug, resolvedFrom } = await fetchEndpoints(model, apiKey, { refresh: args === "refresh" });
+			const { endpoints, error, slug, resolvedFrom } = await fetchEndpoints(model, apiKey, {
+				refresh: args === "refresh",
+			});
 			const flex = flexEndpoints(endpoints);
 			const turn = resolveTurnMix(agentDir);
 			const reference = referencePrice(endpoints, catalogCost(model), turn.mix);
@@ -1058,16 +1127,22 @@ export default function (pi: ExtensionAPI) {
 			if (args === "refresh") {
 				if (bindingFor(agentDir, model)?.flex) recordAdvice(ctx, model, endpoints);
 				else advice.delete(bindingKey(model));
-				ctx.ui.notify(`Endpoint cache cleared (${flex.length} flex endpoint${flex.length === 1 ? "" : "s"})`, "info");
+				ctx.ui.notify(
+					`Endpoint cache cleared (${flex.length} flex endpoint${flex.length === 1 ? "" : "s"})`,
+					"info",
+				);
 				syncStatus(ctx);
 				return;
 			}
 
 			if (error || flex.length === 0) {
-				const tiers = [...new Set(endpoints.map((endpoint) => endpoint.service_tier ?? "default"))].sort();
+				const tiers = [
+					...new Set(endpoints.map((endpoint) => endpoint.service_tier ?? "default")),
+				].sort();
 				if (endpoints.length === 0) {
 					const unresolved = slug.startsWith("~");
-					const hint = error ??
+					const hint =
+						error ??
 						`OpenRouter lists no endpoints for \`${slug}\`${about}${unresolved ? " (an unrecognized Pi latest-alias; use the concrete model id)" : ""}`;
 					ctx.ui.notify(hint, "warning");
 					return;
@@ -1181,17 +1256,25 @@ export default function (pi: ExtensionAPI) {
 				{ value: "status", label: "status", description: "Show the pin for the current model" },
 				{ value: "off", label: "off", description: "Remove the pin for the current model" },
 				{ value: "prefer", label: "prefer", description: "Prefer providers but allow fallbacks" },
-				{ value: "prefer strict", label: "prefer strict", description: "Prefer providers in order, no fallbacks" },
+				{
+					value: "prefer strict",
+					label: "prefer strict",
+					description: "Prefer providers in order, no fallbacks",
+				},
 				{ value: "strict", label: "strict", description: "Order providers, disallow fallbacks" },
 				{ value: "session", label: "session", description: "Scope the pin to this session only" },
-				{ value: "session off", label: "session off", description: "Ignore the persisted pin for this session" },
+				{
+					value: "session off",
+					label: "session off",
+					description: "Ignore the persisted pin for this session",
+				},
 			];
 			const matches = items.filter((item) => item.value.startsWith(prefix.trim().toLowerCase()));
 			return matches.length > 0 ? matches : null;
 		},
 		handler: async (rawArgs, ctx) => {
 			const parsed = parsePinArgs(rawArgs);
-			let args = parsed.rest;
+			const args = parsed.rest;
 			const scope = parsed.scope;
 
 			if (isHelpArg(args)) {
@@ -1205,7 +1288,10 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (model.provider !== "openrouter") {
-				ctx.ui.notify(`/pin applies to OpenRouter models only (current: ${model.provider}/${model.id})`, "warning");
+				ctx.ui.notify(
+					`/pin applies to OpenRouter models only (current: ${model.provider}/${model.id})`,
+					"warning",
+				);
 				return;
 			}
 
@@ -1219,7 +1305,10 @@ export default function (pi: ExtensionAPI) {
 					persistSessionPins();
 					ensureAdvice(ctx, model);
 					syncStatus(ctx);
-					ctx.ui.notify(`${model.id} uses OpenRouter's default provider routing for this session`, "info");
+					ctx.ui.notify(
+						`${model.id} uses OpenRouter's default provider routing for this session`,
+						"info",
+					);
 					return;
 				}
 				setPinBinding(agentDir, key, null);
@@ -1274,7 +1363,10 @@ export default function (pi: ExtensionAPI) {
 				const { endpoints, error, slug } = await fetchEndpoints(model, apiKey);
 				const providers = providersOf(endpoints);
 				if (error || providers.length === 0) {
-					ctx.ui.notify(`OpenRouter: ${error ?? `no endpoints are listed for \`${slug}\``}`, "warning");
+					ctx.ui.notify(
+						`OpenRouter: ${error ?? `no endpoints are listed for \`${slug}\``}`,
+						"warning",
+					);
 					return;
 				}
 				if (!ctx.hasUI) {
@@ -1284,13 +1376,20 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				const labels = providers.map(providerLabel);
-				const pinKind = mode === "prefer" ? (allowFallbacks ? "Prefer" : "Prefer (no fallbacks)") : "Pin";
+				const pinKind =
+					mode === "prefer" ? (allowFallbacks ? "Prefer" : "Prefer (no fallbacks)") : "Pin";
 				const scopeNote = scope === "session" ? " for this session" : "";
-				const choice = await ctx.ui.select(`${pinKind} ${slug} on which provider${scopeNote}?`, labels);
+				const choice = await ctx.ui.select(
+					`${pinKind} ${slug} on which provider${scopeNote}?`,
+					labels,
+				);
 				if (choice === undefined) return;
 				const chosen = providers[labels.indexOf(choice)]?.slug;
 				if (!chosen) return;
-				const incompatible = flex && !flex.endpoint ? flexCapabilityWarning([chosen], mode, endpoints, slug) : undefined;
+				const incompatible =
+					flex && !flex.endpoint
+						? flexCapabilityWarning([chosen], mode, endpoints, slug)
+						: undefined;
 				if (incompatible) {
 					ctx.ui.notify(incompatible, "warning");
 					return;

@@ -35,34 +35,34 @@
  *               in the TUI as well
  */
 
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
-import { join } from "node:path";
-import { existsSync, readFileSync } from "node:fs";
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 interface GuardRule {
-  /** Regex pattern to match against the full command string */
-  pattern: string;
-  /** "block" = deny outright, "confirm" = ask user first */
-  action: "block" | "confirm";
-  /** Optional friendly label shown in UI */
-  label?: string;
-  /**
-   * Custom text, interpreted by action:
-   *   "confirm" - the question shown to the human in the dialog
-   *   "block"   - the reason handed to the AI
-   */
-  message?: string;
-  /** Optional replacement for the default "the user declined" reason ("confirm" only) */
-  denyMessage?: string;
+	/** Regex pattern to match against the full command string */
+	pattern: string;
+	/** "block" = deny outright, "confirm" = ask user first */
+	action: "block" | "confirm";
+	/** Optional friendly label shown in UI */
+	label?: string;
+	/**
+	 * Custom text, interpreted by action:
+	 *   "confirm" - the question shown to the human in the dialog
+	 *   "block"   - the reason handed to the AI
+	 */
+	message?: string;
+	/** Optional replacement for the default "the user declined" reason ("confirm" only) */
+	denyMessage?: string;
 }
 
 interface CommandGuardConfig {
-  rules: GuardRule[];
+	rules: GuardRule[];
 }
 
 // ---------------------------------------------------------------------------
@@ -70,30 +70,23 @@ interface CommandGuardConfig {
 // ---------------------------------------------------------------------------
 
 function loadRules(): GuardRule[] {
-  const globalPath = join(
-    process.env.HOME ?? "",
-    ".pi",
-    "agent",
-    "command-guard.json"
-  );
-  const projectPath = join(process.cwd(), ".pi", "command-guard.json");
+	const globalPath = join(process.env.HOME ?? "", ".pi", "agent", "command-guard.json");
+	const projectPath = join(process.cwd(), ".pi", "command-guard.json");
 
-  const configPath = existsSync(projectPath) ? projectPath : globalPath;
+	const configPath = existsSync(projectPath) ? projectPath : globalPath;
 
-  if (!existsSync(configPath)) {
-    return [];
-  }
+	if (!existsSync(configPath)) {
+		return [];
+	}
 
-  try {
-    const raw = readFileSync(configPath, "utf-8");
-    const config: CommandGuardConfig = JSON.parse(raw);
-    return config.rules ?? [];
-  } catch (err) {
-    console.error(
-      `[command-guard] Failed to load config from ${configPath}: ${err}`
-    );
-    return [];
-  }
+	try {
+		const raw = readFileSync(configPath, "utf-8");
+		const config: CommandGuardConfig = JSON.parse(raw);
+		return config.rules ?? [];
+	} catch (err) {
+		console.error(`[command-guard] Failed to load config from ${configPath}: ${err}`);
+		return [];
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -109,15 +102,15 @@ function loadRules(): GuardRule[] {
  * template states plainly that the user refused and must not be re-asked.
  */
 function declineReason(rule: GuardRule, cmd: string): string {
-  if (rule.denyMessage) return rule.denyMessage;
+	if (rule.denyMessage) return rule.denyMessage;
 
-  const label = rule.label ?? rule.pattern;
-  return [
-    `The user declined to run this command (${label}); it did not execute.`,
-    "This is a refusal by the user, not an environment, permission, or syntax error, and not a temporary failure.",
-    "Do not retry it, and do not retry the same operation rewritten to avoid the matched pattern.",
-    `Command that was refused:\n${cmd}`,
-  ].join("\n\n");
+	const label = rule.label ?? rule.pattern;
+	return [
+		`The user declined to run this command (${label}); it did not execute.`,
+		"This is a refusal by the user, not an environment, permission, or syntax error, and not a temporary failure.",
+		"Do not retry it, and do not retry the same operation rewritten to avoid the matched pattern.",
+		`Command that was refused:\n${cmd}`,
+	].join("\n\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -125,47 +118,43 @@ function declineReason(rule: GuardRule, cmd: string): string {
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
-  // Load rules at init time. On /reload the extension re-runs and picks up
-  // the new config.
-  const rules = loadRules();
+	// Load rules at init time. On /reload the extension re-runs and picks up
+	// the new config.
+	const rules = loadRules();
 
-  if (rules.length === 0) return;
+	if (rules.length === 0) return;
 
-  // Pre-compile regexes for efficiency
-  const compiled: Array<{ regex: RegExp; rule: GuardRule }> = rules.map(
-    (r) => ({
-      regex: new RegExp(r.pattern, "i"), // case-insensitive
-      rule: r,
-    })
-  );
+	// Pre-compile regexes for efficiency
+	const compiled: Array<{ regex: RegExp; rule: GuardRule }> = rules.map((r) => ({
+		regex: new RegExp(r.pattern, "i"), // case-insensitive
+		rule: r,
+	}));
 
-  pi.on("tool_call", async (event, ctx) => {
-    if (!isToolCallEventType("bash", event)) return;
+	pi.on("tool_call", async (event, ctx) => {
+		if (!isToolCallEventType("bash", event)) return;
 
-    const cmd = event.input.command ?? "";
+		const cmd = event.input.command ?? "";
 
-    for (const { regex, rule } of compiled) {
-      if (regex.test(cmd)) {
-        if (rule.action === "block") {
-          return {
-            block: true,
-            reason:
-              rule.message ??
-              `Blocked by command-guard: ${rule.label ?? rule.pattern}`,
-          };
-        }
+		for (const { regex, rule } of compiled) {
+			if (regex.test(cmd)) {
+				if (rule.action === "block") {
+					return {
+						block: true,
+						reason: rule.message ?? `Blocked by command-guard: ${rule.label ?? rule.pattern}`,
+					};
+				}
 
-        if (rule.action === "confirm") {
-          const ok = await ctx.ui.confirm(
-            rule.label ?? "Dangerous command",
-            rule.message ??
-              `Command matches rule: ${rule.pattern}\n\nFull command:\n${cmd}\n\nAllow?`
-          );
-          if (!ok) {
-            return { block: true, reason: declineReason(rule, cmd) };
-          }
-        }
-      }
-    }
-  });
+				if (rule.action === "confirm") {
+					const ok = await ctx.ui.confirm(
+						rule.label ?? "Dangerous command",
+						rule.message ??
+							`Command matches rule: ${rule.pattern}\n\nFull command:\n${cmd}\n\nAllow?`,
+					);
+					if (!ok) {
+						return { block: true, reason: declineReason(rule, cmd) };
+					}
+				}
+			}
+		}
+	});
 }

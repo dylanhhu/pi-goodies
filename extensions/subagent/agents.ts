@@ -130,7 +130,8 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 	const projectAgentsDir = findNearestProjectAgentsDir(cwd);
 
 	const userAgents = scope === "project" ? [] : loadAgentsFromDir(userDir, "user");
-	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project");
+	const projectAgents =
+		scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project");
 
 	const agentMap = new Map<string, AgentConfig>();
 
@@ -146,7 +147,10 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 	return { agents: Array.from(agentMap.values()), projectAgentsDir };
 }
 
-export function formatAgentList(agents: AgentConfig[], maxItems: number): { text: string; remaining: number } {
+export function formatAgentList(
+	agents: AgentConfig[],
+	maxItems: number,
+): { text: string; remaining: number } {
 	if (agents.length === 0) return { text: "none", remaining: 0 };
 	const listed = agents.slice(0, maxItems);
 	const remaining = agents.length - listed.length;

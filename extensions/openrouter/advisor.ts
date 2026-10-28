@@ -16,14 +16,9 @@
  * - A pinned flex endpoint makes the pin dormant, so the baseline is unrestricted.
  */
 
-import type { Endpoint, FlexBinding, PinBinding, PriceReference, TurnMix } from "./types.ts";
-import {
-	endpointTurnCost,
-	flexEndpoints,
-	providerSlugOf,
-	referencePrice,
-} from "./catalog.ts";
+import { endpointTurnCost, flexEndpoints, providerSlugOf, referencePrice } from "./catalog.ts";
 import { effectiveFlexEndpoint } from "./route.ts";
+import type { Endpoint, FlexBinding, PinBinding, PriceReference, TurnMix } from "./types.ts";
 
 export interface FlexAdvice {
 	/** True when standard routing is cheaper than the flex endpoint serving the request. */

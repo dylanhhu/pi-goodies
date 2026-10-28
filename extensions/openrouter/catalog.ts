@@ -77,7 +77,8 @@ async function fetchAliasMap(
 			if (Array.isArray(body?.data)) {
 				for (const entry of body.data as CatalogEntry[]) {
 					const id = typeof entry?.id === "string" ? entry.id : undefined;
-					const target = typeof entry?.alias_target?.slug === "string" ? entry.alias_target.slug : undefined;
+					const target =
+						typeof entry?.alias_target?.slug === "string" ? entry.alias_target.slug : undefined;
 					if (id?.startsWith("~") && target) aliases.set(id, target);
 				}
 			}
@@ -121,26 +122,51 @@ export async function fetchEndpoints(
 			signal: AbortSignal.timeout(ENDPOINTS_TIMEOUT_MS),
 		});
 	} catch (error) {
-		return { endpoints: [], error: `Endpoint list request failed: ${describe(error)}`, slug, resolvedFrom };
+		return {
+			endpoints: [],
+			error: `Endpoint list request failed: ${describe(error)}`,
+			slug,
+			resolvedFrom,
+		};
 	}
 
 	if (response.status === 404) {
-		return { endpoints: [], error: `OpenRouter does not list endpoints for \`${slug}\``, slug, resolvedFrom };
+		return {
+			endpoints: [],
+			error: `OpenRouter does not list endpoints for \`${slug}\``,
+			slug,
+			resolvedFrom,
+		};
 	}
 	if (!response.ok) {
-		return { endpoints: [], error: `Endpoint list request failed: HTTP ${response.status}`, slug, resolvedFrom };
+		return {
+			endpoints: [],
+			error: `Endpoint list request failed: HTTP ${response.status}`,
+			slug,
+			resolvedFrom,
+		};
 	}
 
 	let body: unknown;
 	try {
 		body = await response.json();
 	} catch (error) {
-		return { endpoints: [], error: `Invalid endpoint list response: ${describe(error)}`, slug, resolvedFrom };
+		return {
+			endpoints: [],
+			error: `Invalid endpoint list response: ${describe(error)}`,
+			slug,
+			resolvedFrom,
+		};
 	}
 
 	const raw = (body as { data?: { endpoints?: unknown } } | undefined)?.data?.endpoints;
 	if (!Array.isArray(raw)) {
-		return { endpoints: [], error: "Invalid endpoint list response: missing data.endpoints", slug, resolvedFrom };
+		return {
+			endpoints: [],
+			error: "Invalid endpoint list response: missing data.endpoints",
+			slug,
+			resolvedFrom,
+		};
 	}
 
 	const endpoints = raw.filter(isEndpoint);
@@ -160,7 +186,11 @@ export function clearEndpointCache(): void {
 }
 
 function isEndpoint(value: unknown): value is Endpoint {
-	return typeof value === "object" && value !== null && typeof (value as { tag?: unknown }).tag === "string";
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		typeof (value as { tag?: unknown }).tag === "string"
+	);
 }
 
 /** Flex endpoints, cheapest prompt rate first. */
@@ -353,7 +383,9 @@ export function flexComparisonRefs(
 	push(reference);
 	const siblingTag = standardSiblingTag(endpoint);
 	if (siblingTag) {
-		const sibling = endpoints.find((candidate) => !candidate.service_tier && candidate.tag === siblingTag);
+		const sibling = endpoints.find(
+			(candidate) => !candidate.service_tier && candidate.tag === siblingTag,
+		);
 		if (sibling) push({ cost: endpointTurnCost(sibling, mix), label: siblingTag });
 	}
 	refs.sort((a, b) => a.cost - b.cost);
@@ -401,7 +433,11 @@ export function formatUsd(value: number): string {
 	if (value === 0) return "$0";
 	// Keep two significant digits even for sub-cent per-turn costs.
 	const decimals =
-		value >= 1 ? 2 : value >= 0.01 ? 3 : Math.min(8, Math.max(3, Math.ceil(-Math.log10(value)) + 2));
+		value >= 1
+			? 2
+			: value >= 0.01
+				? 3
+				: Math.min(8, Math.max(3, Math.ceil(-Math.log10(value)) + 2));
 	return `$${value.toFixed(decimals)}`;
 }
 
@@ -422,14 +458,16 @@ export function blendNote(mix: TurnMix): string {
 }
 
 export function turnMixNote(mix: TurnMix, meta: { turns?: number; source: string }): string {
-	const provenance = meta.turns !== undefined ? `${meta.turns.toLocaleString("en-US")} turns` : meta.source;
+	const provenance =
+		meta.turns !== undefined ? `${meta.turns.toLocaleString("en-US")} turns` : meta.source;
 	return `${blendNote(mix)} (${provenance})`;
 }
 
 /** Per-Mtok cell `in/out/cr` for the endpoint's listed rates; `—` marks an unlisted cache rate. */
 export function ratesCell(pricing: EndpointPricing | undefined): string {
 	const p = pricing ?? {};
-	const cacheRead = p.input_cache_read === undefined ? "—" : formatPerMillion(ratePerToken(p.input_cache_read));
+	const cacheRead =
+		p.input_cache_read === undefined ? "—" : formatPerMillion(ratePerToken(p.input_cache_read));
 	return `${formatPerMillion(ratePerToken(p.prompt))}/${formatPerMillion(ratePerToken(p.completion))}/${cacheRead}`;
 }
 

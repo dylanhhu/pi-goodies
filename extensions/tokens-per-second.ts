@@ -34,17 +34,28 @@
  * /reload is only needed after editing the JSON by hand.
  */
 
-import type { ExtensionAPI, ExtensionContext, ThemeColor } from "@earendil-works/pi-coding-agent";
-import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
-import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { Container, Input, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import type { ExtensionAPI, ExtensionContext, ThemeColor } from "@earendil-works/pi-coding-agent";
+import {
+	CONFIG_DIR_NAME,
+	getAgentDir,
+	getSettingsListTheme,
+} from "@earendil-works/pi-coding-agent";
+import { Container, Input, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
 
 const STATUS_KEY = "tokens-per-second";
 
 /** Foreground theme tokens offered by the editor. */
-const COLOR_VALUES: ThemeColor[] = ["error", "warning", "success", "accent", "text", "muted", "dim"];
+const COLOR_VALUES: ThemeColor[] = [
+	"error",
+	"warning",
+	"success",
+	"accent",
+	"text",
+	"muted",
+	"dim",
+];
 
 interface Tier {
 	/** Exclusive upper bound of the tier in tokens per second. */
@@ -125,12 +136,17 @@ function saveConfig(scale: Tier[], overflowColor: ThemeColor): string {
 	const path = activeConfigPath();
 	let existing: Record<string, unknown> = {};
 	try {
-		if (existsSync(path)) existing = JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
+		if (existsSync(path))
+			existing = JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
 	} catch {
 		// A malformed file is replaced rather than blocking edits.
 	}
 	mkdirSync(dirname(path), { recursive: true });
-	writeFileSync(path, `${JSON.stringify({ ...existing, scale, overflowColor }, null, 2)}\n`, "utf8");
+	writeFileSync(
+		path,
+		`${JSON.stringify({ ...existing, scale, overflowColor }, null, 2)}\n`,
+		"utf8",
+	);
 	return path;
 }
 
@@ -185,28 +201,27 @@ export default function (pi: ExtensionAPI) {
 			if (lastTps !== undefined) renderStatus(ctx, lastTps);
 		};
 
-		const numberSubmenu =
-			(currentValue: string, done: (selectedValue?: string) => void) => {
-				const input = new Input({ placeholder: `current: ${currentValue}` });
-				input.focused = true;
-				input.onSubmit = (value) => done(value.trim() || currentValue);
-				input.onEscape = () => done();
-				return {
-					render(width: number) {
-						return [
-							ctx.ui.theme.fg("accent", ctx.ui.theme.bold("Upper bound (tokens/sec, exclusive)")),
-							...input.render(width),
-							ctx.ui.theme.fg("dim", "enter save • esc cancel"),
-						];
-					},
-					invalidate() {
-						input.invalidate();
-					},
-					handleInput(data: string) {
-						input.handleInput(data);
-					},
-				};
+		const numberSubmenu = (currentValue: string, done: (selectedValue?: string) => void) => {
+			const input = new Input({ placeholder: `current: ${currentValue}` });
+			input.focused = true;
+			input.onSubmit = (value) => done(value.trim() || currentValue);
+			input.onEscape = () => done();
+			return {
+				render(width: number) {
+					return [
+						ctx.ui.theme.fg("accent", ctx.ui.theme.bold("Upper bound (tokens/sec, exclusive)")),
+						...input.render(width),
+						ctx.ui.theme.fg("dim", "enter save • esc cancel"),
+					];
+				},
+				invalidate() {
+					input.invalidate();
+				},
+				handleInput(data: string) {
+					input.handleInput(data);
+				},
 			};
+		};
 
 		const items: SettingItem[] = [];
 		scale.forEach((tier, index) => {
@@ -222,7 +237,8 @@ export default function (pi: ExtensionAPI) {
 			items.push({
 				id: `tier-${index}-color`,
 				label: `Tier ${index + 1} color`,
-				description: tier.maxTps === undefined ? "Catches every rate at or above lower bounds" : undefined,
+				description:
+					tier.maxTps === undefined ? "Catches every rate at or above lower bounds" : undefined,
 				currentValue: tier.color,
 				values: COLOR_VALUES,
 			});
@@ -242,7 +258,10 @@ export default function (pi: ExtensionAPI) {
 				new (class {
 					render() {
 						const legend = scale.map((tier) =>
-							theme.fg(tier.color, tier.maxTps === undefined ? "everything else" : `<${tier.maxTps}`),
+							theme.fg(
+								tier.color,
+								tier.maxTps === undefined ? "everything else" : `<${tier.maxTps}`,
+							),
 						);
 						return [
 							theme.fg("accent", theme.bold("Tokens per second colors")),
@@ -287,7 +306,10 @@ export default function (pi: ExtensionAPI) {
 					const previous = scale[index - 1]?.maxTps ?? Number.NEGATIVE_INFINITY;
 					const next = scale[index + 1]?.maxTps ?? Number.POSITIVE_INFINITY;
 					if (!Number.isFinite(bound) || bound <= 0 || bound <= previous || bound >= next) {
-						ctx.ui.notify(`Bound must be a positive number between ${previous} and ${next}`, "warning");
+						ctx.ui.notify(
+							`Bound must be a positive number between ${previous} and ${next}`,
+							"warning",
+						);
 						settingsList.updateValue(id, String(tier.maxTps));
 						return;
 					}
@@ -338,7 +360,11 @@ export default function (pi: ExtensionAPI) {
 
 			if (input) {
 				const bounds = input.split(/\s+/).map(Number);
-				if (bounds.length !== 2 || bounds.some((n) => !Number.isFinite(n) || n <= 0) || bounds[0] >= bounds[1]) {
+				if (
+					bounds.length !== 2 ||
+					bounds.some((n) => !Number.isFinite(n) || n <= 0) ||
+					bounds[0] >= bounds[1]
+				) {
 					ctx.ui.notify("Usage: /tps 20 60, /tps reset, or /tps for the editor", "warning");
 					return;
 				}

@@ -12,6 +12,7 @@
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { isRecord } from "./catalog.ts";
 import type {
 	EndpointPricing,
 	FallbackRouting,
@@ -23,7 +24,6 @@ import type {
 	TurnMix,
 	UsageLike,
 } from "./types.ts";
-import { isRecord } from "./catalog.ts";
 
 export const STATE_FILE = "openrouter.json";
 export const LEGACY_FLEX_FILE = "flex.json";
@@ -81,20 +81,30 @@ function parsePinBinding(value: unknown): PinBinding | undefined {
 		providers,
 		mode,
 		// Older prefer pins predate the flag and meant fallbacks allowed.
-		allowFallbacks: typeof value.allowFallbacks === "boolean" ? value.allowFallbacks : mode === "prefer",
+		allowFallbacks:
+			typeof value.allowFallbacks === "boolean" ? value.allowFallbacks : mode === "prefer",
 		updatedAt: typeof value.updatedAt === "number" ? value.updatedAt : Date.now(),
 	};
 }
 
 function parseFallbackRouting(value: unknown): FallbackRouting | undefined {
-	return value === "openrouter" ? "openrouter" : value === "same-provider" ? "same-provider" : undefined;
+	return value === "openrouter"
+		? "openrouter"
+		: value === "same-provider"
+			? "same-provider"
+			: undefined;
 }
 
 function parseTurnMix(value: unknown): TurnMix | undefined {
 	if (!isRecord(value)) return undefined;
 	const values = [value.input, value.cacheRead, value.cacheWrite, value.output];
 	if (!values.every((entry) => typeof entry === "number" && entry >= 0)) return undefined;
-	return { input: value.input as number, cacheRead: value.cacheRead as number, cacheWrite: value.cacheWrite as number, output: value.output as number };
+	return {
+		input: value.input as number,
+		cacheRead: value.cacheRead as number,
+		cacheWrite: value.cacheWrite as number,
+		output: value.output as number,
+	};
 }
 
 /** Merge the two legacy files into one unified state. */
@@ -181,7 +191,10 @@ export function bindingKey(model: { provider: string; id: string }): string {
 	return `${model.provider}:${model.id}`;
 }
 
-export function bindingFor(agentDir: string, model: { provider: string; id: string }): ModelBinding | undefined {
+export function bindingFor(
+	agentDir: string,
+	model: { provider: string; id: string },
+): ModelBinding | undefined {
 	return loadState(agentDir).models[bindingKey(model)];
 }
 
@@ -304,7 +317,12 @@ export function resolvePin(
 // Turn-mix resolution
 // ---------------------------------------------------------------------------
 
-const DEFAULT_TURN_MIX: TurnMix = { input: 2_000, cacheRead: 40_000, cacheWrite: 500, output: 1_000 };
+const DEFAULT_TURN_MIX: TurnMix = {
+	input: 2_000,
+	cacheRead: 40_000,
+	cacheWrite: 500,
+	output: 1_000,
+};
 
 let turnMixCache: { at: number; mix: TurnMix; turns: number } | undefined;
 
@@ -382,7 +400,8 @@ function scanTurnMix(agentDir: string): { mix: TurnMix; turns: number } | undefi
 		}
 		if (inputs.length < TURN_MIX_MIN_TURNS) return undefined;
 		// Cache writes land on few turns (session cold starts), so expected value beats median.
-		const roundTo = (value: number, quantum: number): number => Math.round(value / quantum) * quantum;
+		const roundTo = (value: number, quantum: number): number =>
+			Math.round(value / quantum) * quantum;
 		return {
 			mix: {
 				input: roundTo(median(inputs), 100),

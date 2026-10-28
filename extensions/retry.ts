@@ -23,10 +23,16 @@
  * with that entry; otherwise the retry would leave a tool call without a result.
  */
 
-import type { ExtensionAPI, ExtensionCommandContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+	SessionEntry,
+} from "@earendil-works/pi-coding-agent";
 
 function isContextMessage(entry: SessionEntry): boolean {
-	return entry.type === "custom_message" || (entry.type === "message" && entry.message.role !== "system");
+	return (
+		entry.type === "custom_message" || (entry.type === "message" && entry.message.role !== "system")
+	);
 }
 
 function hasToolCalls(entry: SessionEntry): boolean {
@@ -38,7 +44,9 @@ function hasToolCalls(entry: SessionEntry): boolean {
 }
 
 function isUserOrCustomMessage(entry: SessionEntry): boolean {
-	return entry.type === "custom_message" || (entry.type === "message" && entry.message.role === "user");
+	return (
+		entry.type === "custom_message" || (entry.type === "message" && entry.message.role === "user")
+	);
 }
 
 /** Nearest ancestor that contributes a model message, skipping state entries. */
@@ -105,7 +113,11 @@ const HELP_TEXT = [
 ].join("\n");
 
 const ARG_COMPLETIONS = [
-	{ value: "last", label: "last", description: "Drop the latest message or step and retry from before it" },
+	{
+		value: "last",
+		label: "last",
+		description: "Drop the latest message or step and retry from before it",
+	},
 	{ value: "help", label: "help", description: "Show retry usage and behavior notes" },
 ];
 
@@ -166,7 +178,7 @@ export default function (pi: ExtensionAPI) {
 					// If an interrupted tool call sits directly before the prompt, branch
 					// before that call instead; otherwise the retried prompt would follow
 					// an assistant tool call with no matching result.
-					let target = lastUser;
+					let target: SessionEntry = lastUser;
 					const ancestor = nearestContextAncestor(ctx, lastUser);
 					if (ancestor && hasToolCalls(ancestor)) {
 						let branchPoint = ancestor;
