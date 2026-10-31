@@ -63,7 +63,7 @@ export interface GuardContext {
 
 export type GuardResult = { block: true; reason: string } | undefined;
 
-/** Longest action text shown in a dialog or handed back to the model. */
+/** Longest action text handed back to the model. */
 const DISPLAY_MAX = 2_000;
 
 /** Keep the head and tail of long text for display; the full action is still what was judged. */
@@ -74,8 +74,44 @@ function clipForDisplay(text: string): string {
 	return `${text.slice(0, head)}\n[... ${(text.length - DISPLAY_MAX).toLocaleString("en-US")} characters omitted ...]\n${text.slice(-tail)}`;
 }
 
+/** The action as text, unclipped. */
+function actionText(d: Descriptor): string {
+	return d.tool === "bash" ? (d.command ?? "") : `${d.tool} ${d.paths.join(", ")}`;
+}
+
 function summarize(d: Descriptor): string {
-	return clipForDisplay(d.tool === "bash" ? (d.command ?? "") : `${d.tool} ${d.paths.join(", ")}`);
+	return clipForDisplay(actionText(d));
+}
+
+/**
+ * The action shown in a confirm dialog. The transcript already holds the full command, so the
+ * dialog shows only enough of its opening to tell apart calls issued in parallel; a long preview
+ * would be clipped by the dialog itself, taking the Yes/No options off the screen with it.
+ */
+const PREVIEW_LINES = 2;
+const PREVIEW_LINE_MAX = 100;
+
+function more(n: number, noun: string): string {
+	return `${n.toLocaleString("en-US")} more ${noun}${n === 1 ? "" : "s"}`;
+}
+
+function previewForDialog(text: string): string {
+	// Trailing blank lines say nothing about the action, and splitting would count them
+	const trimmed = text.trimEnd();
+	const lines = trimmed.split("\n");
+	const head = lines.slice(0, PREVIEW_LINES);
+	const shown = head.map((line) =>
+		line.length > PREVIEW_LINE_MAX ? `${line.slice(0, PREVIEW_LINE_MAX - 1)}…` : line,
+	);
+	if (lines.length === head.length && shown.join("\n") === trimmed) return trimmed;
+
+	const hiddenLines = lines.length - head.length;
+	const hiddenChars = head.reduce((n, line, i) => n + line.length - shown[i].length, 0);
+	const hidden = [
+		hiddenLines > 0 ? more(hiddenLines, "line") : undefined,
+		hiddenChars > 0 ? more(hiddenChars, "character") : undefined,
+	];
+	return [...shown, `[… ${hidden.filter(Boolean).join(", ")}]`].join("\n");
 }
 
 /** Why the call was flagged, in a few words. */
@@ -115,7 +151,7 @@ function confirmMessage(decision: Decision, d: Descriptor): string {
 		lines.push(`Scores: ${scores}`);
 	}
 	for (const note of decision.verdict?.notes ?? []) lines.push(`Note: ${note}`);
-	lines.push("", summarize(d), "", "Allow?");
+	lines.push("", previewForDialog(actionText(d)), "", "Allow?");
 	return lines.join("\n");
 }
 

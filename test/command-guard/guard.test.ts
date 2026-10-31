@@ -165,6 +165,48 @@ describe("guard: confirm", () => {
 	});
 });
 
+describe("guard: confirm dialog preview", () => {
+	const rules: GuardRule[] = [
+		{ id: "script", pattern: "^\\s*set -e", action: "confirm", label: "shell script" },
+	];
+
+	/** The action preview sits between the cause and the question. */
+	const preview = (message: string) => message.split("\n\n")[1] ?? "";
+
+	test("a command that fits is shown as written", async () => {
+		const { call, dialogs } = setup({ rules, approve: true });
+		await call("bash", bash("set -e; ls -la"));
+		assert.equal(preview(dialogs[0].message), "set -e; ls -la");
+	});
+
+	test("a long script keeps its first two lines and counts the rest", async () => {
+		const script = ["set -e", "for f in a b c; do", '  echo "$f"', "done", "exit 0"];
+		const { call, dialogs } = setup({ rules, approve: true });
+		await call("bash", bash(script.join("\n")));
+		const shown = preview(dialogs[0].message).split("\n");
+		assert.deepEqual(shown, ["set -e", "for f in a b c; do", "[… 3 more lines]"]);
+	});
+
+	test("a long single line is cut, so the dialog keeps room for the options", async () => {
+		const { call, dialogs } = setup({ rules, approve: true });
+		await call("bash", bash(`set -e; ${"x".repeat(400)}`));
+		const shown = preview(dialogs[0].message).split("\n");
+		assert.equal(shown.length, 2);
+		assert.match(shown[0], /^set -e; x+…$/);
+		assert.equal(shown[0].length, 100);
+		assert.equal(shown[1], "[… 308 more characters]");
+	});
+
+	test("parallel calls stay distinguishable by their opening", async () => {
+		const { call, dialogs } = setup({ rules, approve: true });
+		await call("bash", bash(`set -e\nmake build ${"y".repeat(200)}`));
+		await call("bash", bash(`set -e\nmake test ${"y".repeat(200)}`));
+		assert.match(preview(dialogs[0].message), /make build/);
+		assert.match(preview(dialogs[1].message), /make test/);
+		assert.notEqual(preview(dialogs[0].message), preview(dialogs[1].message));
+	});
+});
+
 describe("guard: trace of approved calls", () => {
 	const config: GuardConfig = { profile: "balanced", judge: { model: "p/m" } };
 	const allow: JudgeVerdict = {
@@ -406,19 +448,22 @@ describe("guard: oversized actions", () => {
 	const config: GuardConfig = { limits: { maxActionChars: 3_000 } };
 	const huge = `make ${"a".repeat(4_000)}MIDDLE${"b".repeat(4_000)} END-OF-COMMAND`;
 
-	test("the human is asked, and the dialog is bounded but shows head and tail", async () => {
+	test("the human is asked, and the dialog shows only the head of the action", async () => {
 		const { call, dialogs, audit } = build({ config });
 		const r = await call("bash", bash(huge));
 		assert.equal(dialogs.length, 1);
 		const { title, message } = dialogs[0];
 		assert.equal(title, "Oversized action");
 		assert.match(message, /too large for automatic review: 8,0\d\d characters, limit 3,000/);
-		assert.ok(message.length < 3_000, `dialog is ${message.length} characters`);
-		assert.ok(message.includes("make aaaa") && message.includes("END-OF-COMMAND"));
-		assert.match(message, /\d,\d{3} characters omitted/);
-		assert.ok(!message.includes("MIDDLE"));
-		// The refusal handed to the model is bounded as well
+		assert.ok(message.length < 1_000, `dialog is ${message.length} characters`);
+		assert.ok(message.split("\n").length <= 8, `dialog is ${message.split("\n").length} lines`);
+		assert.ok(message.includes("make aaaa"));
+		assert.match(message, /\[… 7,\d{3} more characters\]/);
+		// The tail belongs to the transcript, not to the dialog
+		assert.ok(!message.includes("END-OF-COMMAND") && !message.includes("MIDDLE"));
+		// The refusal handed to the model keeps both ends and stays bounded
 		assert.ok((r?.reason ?? "").length < 3_500);
+		assert.match(r?.reason ?? "", /END-OF-COMMAND/);
 		assert.deepEqual(
 			audit.map((a) => [a.source, a.outcome, a.confirmed]),
 			[["oversize", "confirm", false]],

@@ -127,7 +127,7 @@ Actions and user messages are sent to the classifier model's provider. Use a pro
 
 A bash command longer than `limits.maxActionChars` (default 60,000 characters, about 15,000 tokens, which fits the 65,536-token context of small classifiers with room for the user's messages) is never judged or waved through. Likewise a write or edit that would go to the judge. The outcome is `limits.onOversize`:
 
-- `confirm` (default): the human decides, from a dialog showing the head and tail of the command and its length
+- `confirm` (default): the human decides, from a dialog showing the cause, the first two lines of the command, and how much it leaves out. The full command is in the transcript above; the preview only needs enough of the opening to tell apart calls made in parallel
 - `block`: denied, with a reason telling the model to ask the user rather than split the action up
 
 This applies ahead of the allowlist, and rules stricter than the oversize outcome keep their say. Large writes that no rule flagged are unaffected.
