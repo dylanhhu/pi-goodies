@@ -20,12 +20,14 @@ import type {
 } from "./types.ts";
 
 export const ENDPOINTS_TTL_MS = 5 * 60_000;
+/** A failed alias lookup is retried soon, not held for the full TTL. */
+export const ALIAS_FAILURE_TTL_MS = 10_000;
 export const ENDPOINTS_TIMEOUT_MS = 15_000;
 export const DEFAULT_ORIGIN = "https://openrouter.ai";
 
 const endpointCache = new Map<string, { at: number; endpoints: Endpoint[] }>();
 /** Alias id to canonical slug, per API origin. */
-const aliasCache = new Map<string, { at: number; aliases: Map<string, string> }>();
+const aliasCache = new Map<string, { at: number; ttl: number; aliases: Map<string, string> }>();
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -62,11 +64,12 @@ async function fetchAliasMap(
 	options: { refresh?: boolean } = {},
 ): Promise<Map<string, string>> {
 	const cached = aliasCache.get(origin);
-	if (!options.refresh && cached && Date.now() - cached.at < ENDPOINTS_TTL_MS) {
+	if (!options.refresh && cached && Date.now() - cached.at < cached.ttl) {
 		return cached.aliases;
 	}
 
 	const aliases = new Map<string, string>();
+	let succeeded = false;
 	try {
 		const response = await fetch(`${origin}/api/v1/models`, {
 			headers: { accept: "application/json", authorization: `Bearer ${apiKey}` },
@@ -75,6 +78,7 @@ async function fetchAliasMap(
 		if (response.ok) {
 			const body = (await response.json()) as { data?: unknown } | null;
 			if (Array.isArray(body?.data)) {
+				succeeded = true;
 				for (const entry of body.data as CatalogEntry[]) {
 					const id = typeof entry?.id === "string" ? entry.id : undefined;
 					const target =
@@ -86,7 +90,13 @@ async function fetchAliasMap(
 	} catch {
 		// Resolution is best-effort: an unreachable catalog leaves aliases unresolved.
 	}
-	aliasCache.set(origin, { at: Date.now(), aliases });
+	// Only a good answer is held for the full TTL; a failure must not pin aliases as
+	// unresolved for minutes.
+	aliasCache.set(origin, {
+		at: Date.now(),
+		ttl: succeeded ? ENDPOINTS_TTL_MS : ALIAS_FAILURE_TTL_MS,
+		aliases,
+	});
 	return aliases;
 }
 
@@ -174,15 +184,27 @@ export async function fetchEndpoints(
 	return { endpoints, slug, resolvedFrom };
 }
 
-/** Cached endpoints for a model, when a recent lookup exists. No network. */
+/**
+ * Cached endpoints for a model, when a recent lookup exists. No network. A latest alias
+ * is looked up under the canonical slug it resolved to, which is where `fetchEndpoints`
+ * stored it.
+ */
 export function cachedEndpoints(model: { id: string; baseUrl?: string }): Endpoint[] | undefined {
-	const key = `${originOf(model.baseUrl)}:${modelSlug(model.id)}`;
-	const cached = endpointCache.get(key);
+	const origin = originOf(model.baseUrl);
+	const base = modelSlug(model.id);
+	let slug = base;
+	if (base.startsWith("~")) {
+		const aliases = aliasCache.get(origin);
+		if (!aliases || Date.now() - aliases.at >= aliases.ttl) return undefined;
+		slug = aliases.aliases.get(base) ?? base;
+	}
+	const cached = endpointCache.get(`${origin}:${slug}`);
 	return cached && Date.now() - cached.at < ENDPOINTS_TTL_MS ? cached.endpoints : undefined;
 }
 
 export function clearEndpointCache(): void {
 	endpointCache.clear();
+	aliasCache.clear();
 }
 
 function isEndpoint(value: unknown): value is Endpoint {
@@ -193,11 +215,21 @@ function isEndpoint(value: unknown): value is Endpoint {
 	);
 }
 
+/** Prompt rate for ordering; an endpoint with no listed rate sorts last, not first. */
+function sortRate(endpoint: Endpoint): number {
+	const rate = promptRate(endpoint.pricing);
+	return rate > 0 ? rate : Number.POSITIVE_INFINITY;
+}
+
 /** Flex endpoints, cheapest prompt rate first. */
 export function flexEndpoints(endpoints: readonly Endpoint[]): Endpoint[] {
 	return endpoints
 		.filter((endpoint) => endpoint.service_tier === "flex")
-		.sort((a, b) => promptRate(a.pricing) - promptRate(b.pricing));
+		.sort((a, b) => {
+			const left = sortRate(a);
+			const right = sortRate(b);
+			return left === right ? 0 : left < right ? -1 : 1;
+		});
 }
 
 /** Endpoint tags start with the provider slug, e.g. `deepinfra/fp8` or `groq/bf16`. */
@@ -242,31 +274,43 @@ export function promptRate(pricing: EndpointPricing | undefined): number {
 	return ratePerToken(pricing?.prompt);
 }
 
-/** Per-token prices in USD, using prompt-length overrides when the request exceeds them. */
+/** A listed rate, including an explicit zero; an unlisted or invalid rate uses the fallback. */
+function rateOr(value: string | undefined, fallback: number): number {
+	if (value === undefined) return fallback;
+	const parsed = Number.parseFloat(value);
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+/**
+ * Per-token prices in USD, using prompt-length overrides when the request exceeds them.
+ * `promptTokens` is the whole prompt (uncached input plus cache reads and writes), which
+ * is what OpenRouter's prompt-length tiers are measured against.
+ */
 export function effectiveRates(
 	pricing: EndpointPricing,
-	inputTokens: number,
+	promptTokens: number,
 ): { input: number; output: number; cacheRead: number; cacheWrite: number } {
 	const input = ratePerToken(pricing.prompt);
 	const output = ratePerToken(pricing.completion);
-	const cacheRead = ratePerToken(pricing.input_cache_read) || input;
-	const cacheWrite = ratePerToken(pricing.input_cache_write) || input;
+	const cacheRead = rateOr(pricing.input_cache_read, input);
+	const cacheWrite = rateOr(pricing.input_cache_write, input);
 
 	const override = (pricing.overrides ?? [])
-		.filter((entry) => entry && (entry.min_prompt_tokens ?? 0) <= inputTokens)
+		.filter((entry) => entry && (entry.min_prompt_tokens ?? 0) <= promptTokens)
 		.sort((a, b) => (b.min_prompt_tokens ?? 0) - (a.min_prompt_tokens ?? 0))[0];
 	if (!override) return { input, output, cacheRead, cacheWrite };
 
+	const overrideInput = rateOr(override.prompt, input);
 	return {
-		input: ratePerToken(override.prompt) || input,
-		output: ratePerToken(override.completion) || output,
-		cacheRead: ratePerToken(override.input_cache_read) || cacheRead,
-		cacheWrite: ratePerToken(override.input_cache_write) || cacheWrite,
+		input: overrideInput,
+		output: rateOr(override.completion, output),
+		cacheRead: rateOr(override.input_cache_read, cacheRead),
+		cacheWrite: rateOr(override.input_cache_write, cacheWrite),
 	};
 }
 
 export function costFromPricing(pricing: EndpointPricing, usage: UsageLike): UsageLike["cost"] {
-	const rates = effectiveRates(pricing, usage.input);
+	const rates = effectiveRates(pricing, usage.input + usage.cacheRead + usage.cacheWrite);
 	// Round away float noise from multiplying per-token prices by token counts.
 	const round = (value: number): number => Math.round(value * 1e10) / 1e10;
 	const cost = {

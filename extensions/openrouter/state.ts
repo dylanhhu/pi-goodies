@@ -1,16 +1,37 @@
 /**
  * Persisted and session-scoped routing state.
  *
- * A model's flex tier and provider pin now live in one binding (`<provider>:<model id>`
+ * A model's flex tier and provider pin live in one binding (`<provider>:<model id>`
  * in `openrouter.json`), which is what lets the route planner see them together.
  *
- * The first load migrates `flex.json` and `openrouter-pin.json` into the unified file and
- * leaves the legacy files untouched, so reverting to the old extensions still restores the
- * settings they had before this merge. Session-scoped pins keep their old entry type so
- * resumed sessions still restore them.
+ * Durability rules, because a bad state file must never leave Pi unusable or silently
+ * change routing:
+ * - Writes are atomic (temp file, then rename), so a concurrent reader never sees a
+ *   half-written file.
+ * - The legacy `flex.json` and `openrouter-pin.json` are imported only when
+ *   `openrouter.json` does not exist. An unreadable or invalid file is never treated as
+ *   absent: the last good state stays in force, the bad file is backed up, and the
+ *   problem is reported through `stateHealth`.
+ * - The in-memory copy is reloaded whenever the file changes on disk, and every write
+ *   starts from the latest disk state, so two Pi sessions do not overwrite each other
+ *   with stale copies.
+ * - A failed write is returned to the caller instead of being swallowed.
+ *
+ * The legacy files are left untouched, so reverting to the old extensions still restores
+ * the settings they had before this merge. Session-scoped pins keep their old entry type
+ * so resumed sessions still restore them.
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import {
+	copyFileSync,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { isRecord } from "./catalog.ts";
 import type {
@@ -33,8 +54,20 @@ export const SESSION_ENTRY_TYPE = "openrouter-pin-session";
 const TURN_MIX_TTL_MS = 10 * 60_000;
 const TURN_MIX_MAX_FILES = 60;
 const TURN_MIX_MIN_TURNS = 50;
+/** Session files beyond this size are skipped by the turn-mix scan, so it stays cheap. */
+const TURN_MIX_MAX_FILE_BYTES = 25 * 1024 * 1024;
 
-type Cache = { dir: string; state: GatewayState; reads: number };
+/** Why `openrouter.json` could not be used. */
+export interface StateHealth {
+	problem: "invalid" | "unreadable";
+	detail: string;
+	/** Copy of the invalid file, when one could be made. */
+	backupPath?: string;
+	/** True when a previously loaded state is still in force; false when starting empty. */
+	usingLastGood: boolean;
+}
+
+type Cache = { dir: string; state: GatewayState; signature: string; health?: StateHealth };
 
 let cached: Cache | undefined;
 
@@ -42,28 +75,79 @@ function emptyState(): GatewayState {
 	return { version: 1, models: {} };
 }
 
-function readJson(path: string): unknown {
-	if (!existsSync(path)) return undefined;
+function errorText(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+type FileRead =
+	| { kind: "ok"; value: Record<string, unknown> }
+	| { kind: "missing" }
+	| { kind: "invalid"; detail: string }
+	| { kind: "unreadable"; detail: string };
+
+/** Read a JSON object file, telling an absent file apart from one that cannot be trusted. */
+function readJsonFile(path: string): FileRead {
+	let text: string;
 	try {
-		return JSON.parse(readFileSync(path, "utf8"));
-	} catch {
-		return undefined;
+		text = readFileSync(path, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return { kind: "missing" };
+		return { kind: "unreadable", detail: errorText(error) };
+	}
+	try {
+		const value: unknown = JSON.parse(text);
+		if (!isRecord(value)) return { kind: "invalid", detail: "top-level value is not an object" };
+		return { kind: "ok", value };
+	} catch (error) {
+		return { kind: "invalid", detail: errorText(error) };
 	}
 }
 
-function writeJson(path: string, value: unknown): void {
+/** Lenient read for legacy files and overrides: anything unusable counts as absent. */
+function readJson(path: string): Record<string, unknown> | undefined {
+	const read = readJsonFile(path);
+	return read.kind === "ok" ? read.value : undefined;
+}
+
+/** Atomic write: a reader sees the old file or the new one, never a partial file. */
+function writeJsonAtomic(path: string, value: unknown): string | undefined {
+	const temp = `${path}.${process.pid}.${Date.now()}.tmp`;
 	try {
 		mkdirSync(dirname(path), { recursive: true });
-		writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+		writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+		renameSync(temp, path);
+		return undefined;
+	} catch (error) {
+		try {
+			unlinkSync(temp);
+		} catch {
+			// The temp file may never have been created.
+		}
+		return errorText(error);
+	}
+}
+
+/** Identity of the file's current contents, cheap enough to check on every access. */
+function fileSignature(path: string): string {
+	try {
+		const info = statSync(path, { bigint: true });
+		return `${info.ino}:${info.mtimeNs}:${info.size}`;
 	} catch {
-		// A read-only config directory only loses persistence, not routing.
+		return "missing";
 	}
 }
 
 function parseFlexBinding(value: unknown): FlexBinding | undefined {
 	if (!isRecord(value)) return undefined;
+	// Flex is a paid-tier opt-in, so an entry must say so explicitly: a named endpoint, or
+	// `null` for auto. A malformed entry (`{}`, a number) is dropped, never read as auto.
+	let endpoint: string | null;
+	if (value.endpoint === null) endpoint = null;
+	else if (typeof value.endpoint === "string" && value.endpoint.trim() !== "")
+		endpoint = value.endpoint.trim();
+	else return undefined;
 	return {
-		endpoint: typeof value.endpoint === "string" ? value.endpoint : null,
+		endpoint,
 		providerName: typeof value.providerName === "string" ? value.providerName : undefined,
 		pricing: isRecord(value.pricing) ? (value.pricing as EndpointPricing) : undefined,
 		updatedAt: typeof value.updatedAt === "number" ? value.updatedAt : Date.now(),
@@ -73,7 +157,14 @@ function parseFlexBinding(value: unknown): FlexBinding | undefined {
 function parsePinBinding(value: unknown): PinBinding | undefined {
 	if (!isRecord(value)) return undefined;
 	const providers = Array.isArray(value.providers)
-		? value.providers.filter((provider): provider is string => typeof provider === "string")
+		? [
+				...new Set(
+					value.providers
+						.filter((provider): provider is string => typeof provider === "string")
+						.map((provider) => provider.trim().toLowerCase())
+						.filter(Boolean),
+				),
+			]
 		: [];
 	if (providers.length === 0) return undefined;
 	const mode: PinMode = value.mode === "prefer" ? "prefer" : "only";
@@ -82,7 +173,11 @@ function parsePinBinding(value: unknown): PinBinding | undefined {
 		mode,
 		// Older prefer pins predate the flag and meant fallbacks allowed.
 		allowFallbacks:
-			typeof value.allowFallbacks === "boolean" ? value.allowFallbacks : mode === "prefer",
+			mode === "only"
+				? false
+				: typeof value.allowFallbacks === "boolean"
+					? value.allowFallbacks
+					: true,
 		updatedAt: typeof value.updatedAt === "number" ? value.updatedAt : Date.now(),
 	};
 }
@@ -113,7 +208,7 @@ function migrate(agentDir: string): GatewayState | undefined {
 	let found = false;
 
 	const legacyFlex = readJson(join(agentDir, LEGACY_FLEX_FILE));
-	if (isRecord(legacyFlex)) {
+	if (legacyFlex) {
 		found = true;
 		const models = legacyFlex.models;
 		if (isRecord(models)) {
@@ -130,7 +225,7 @@ function migrate(agentDir: string): GatewayState | undefined {
 	}
 
 	const legacyPin = readJson(join(agentDir, LEGACY_PIN_FILE));
-	if (isRecord(legacyPin)) {
+	if (legacyPin) {
 		found = true;
 		const models = legacyPin.models;
 		if (isRecord(models)) {
@@ -145,42 +240,97 @@ function migrate(agentDir: string): GatewayState | undefined {
 	return found ? state : undefined;
 }
 
-export function loadState(agentDir: string): GatewayState {
-	if (cached?.dir === agentDir) return cached.state;
-	const path = join(agentDir, STATE_FILE);
-	const parsed = readJson(path);
-	if (isRecord(parsed)) {
-		const state = emptyState();
-		if (isRecord(parsed.models)) {
-			for (const [key, value] of Object.entries(parsed.models)) {
-				if (!isRecord(value)) continue;
-				const binding: ModelBinding = {};
-				const flex = parseFlexBinding(value.flex);
-				const pin = parsePinBinding(value.pin);
-				if (flex) binding.flex = flex;
-				if (pin) binding.pin = pin;
-				if (binding.flex || binding.pin) state.models[key] = binding;
-			}
+function parseState(parsed: Record<string, unknown>): GatewayState {
+	const state = emptyState();
+	if (isRecord(parsed.models)) {
+		for (const [key, value] of Object.entries(parsed.models)) {
+			if (!isRecord(value)) continue;
+			const binding: ModelBinding = {};
+			const flex = parseFlexBinding(value.flex);
+			const pin = parsePinBinding(value.pin);
+			if (flex) binding.flex = flex;
+			if (pin) binding.pin = pin;
+			if (binding.flex || binding.pin) state.models[key] = binding;
 		}
-		const turnMix = parseTurnMix(parsed.turnMix);
-		if (turnMix) state.turnMix = turnMix;
-		const fallback = parseFallbackRouting(parsed.fallback);
-		if (fallback) state.fallback = fallback;
-		cached = { dir: agentDir, state, reads: 0 };
-		return state;
 	}
-
-	// No unified file: import the legacy settings once, then persist the result.
-	const migrated = migrate(agentDir);
-	const state = migrated ?? emptyState();
-	cached = { dir: agentDir, state, reads: 0 };
-	if (migrated) writeJson(path, state);
+	const turnMix = parseTurnMix(parsed.turnMix);
+	if (turnMix) state.turnMix = turnMix;
+	const fallback = parseFallbackRouting(parsed.fallback);
+	if (fallback) state.fallback = fallback;
 	return state;
 }
 
-export function saveState(agentDir: string, state: GatewayState): void {
-	cached = { dir: agentDir, state, reads: cached?.reads ?? 0 };
-	writeJson(join(agentDir, STATE_FILE), state);
+/** Keep a copy of a file the extension cannot parse, so repairing it never loses data. */
+function backUpInvalid(path: string): string | undefined {
+	const backup = `${path}.invalid-${Date.now()}`;
+	try {
+		copyFileSync(path, backup);
+		return backup;
+	} catch {
+		return undefined;
+	}
+}
+
+export function loadState(agentDir: string): GatewayState {
+	const path = join(agentDir, STATE_FILE);
+	const signature = fileSignature(path);
+	if (cached?.dir === agentDir && cached.signature === signature) return cached.state;
+
+	const read = readJsonFile(path);
+	if (read.kind === "ok") {
+		const state = parseState(read.value);
+		cached = { dir: agentDir, state, signature };
+		return state;
+	}
+
+	if (read.kind === "missing") {
+		// A first run (or a deliberate delete): import the legacy settings, then persist
+		// the result. This is the only path that reads the legacy files.
+		const migrated = migrate(agentDir);
+		const state = migrated ?? emptyState();
+		cached = { dir: agentDir, state, signature };
+		if (migrated && !writeJsonAtomic(path, state)) cached.signature = fileSignature(path);
+		return state;
+	}
+
+	// Unreadable or invalid: never treat as absent, never migrate over it. Keep the last
+	// good state when there is one, otherwise run without routing state.
+	const lastGood = cached?.dir === agentDir ? cached.state : undefined;
+	const health: StateHealth = {
+		problem: read.kind,
+		detail: read.detail,
+		backupPath: read.kind === "invalid" ? backUpInvalid(path) : undefined,
+		usingLastGood: Boolean(lastGood),
+	};
+	const state = lastGood ?? emptyState();
+	cached = { dir: agentDir, state, signature, health };
+	return state;
+}
+
+/** Why the state file is not in use, or `undefined` when it loaded cleanly. */
+export function stateHealth(agentDir: string): StateHealth | undefined {
+	loadState(agentDir);
+	return cached?.dir === agentDir ? cached.health : undefined;
+}
+
+/**
+ * Persist `state` and make it the in-memory state either way, so the running session
+ * follows the command even when the disk is read-only. Returns the write error, if any.
+ */
+export function saveState(agentDir: string, state: GatewayState): string | undefined {
+	const path = join(agentDir, STATE_FILE);
+	const error = writeJsonAtomic(path, state);
+	if (error) {
+		cached = {
+			dir: agentDir,
+			state,
+			signature: cached?.dir === agentDir ? cached.signature : fileSignature(path),
+			health: cached?.dir === agentDir ? cached.health : undefined,
+		};
+		return error;
+	}
+	cached = { dir: agentDir, state, signature: fileSignature(path) };
+	return undefined;
 }
 
 export function clearStateCache(): void {
@@ -202,17 +352,23 @@ function setModelBinding(
 	agentDir: string,
 	key: string,
 	update: (binding: ModelBinding) => ModelBinding | undefined,
-): void {
+): string | undefined {
+	// `loadState` reloads when another process changed the file, so the write below
+	// changes one model's entry on top of the latest disk state.
 	const state = loadState(agentDir);
 	const models = { ...state.models };
 	const next = update(models[key] ?? {});
 	if (next && (next.flex || next.pin)) models[key] = next;
 	else delete models[key];
-	saveState(agentDir, { ...state, version: 1, models });
+	return saveState(agentDir, { ...state, version: 1, models });
 }
 
-export function setFlexBinding(agentDir: string, key: string, flex: FlexBinding | null): void {
-	setModelBinding(agentDir, key, (binding) => {
+export function setFlexBinding(
+	agentDir: string,
+	key: string,
+	flex: FlexBinding | null,
+): string | undefined {
+	return setModelBinding(agentDir, key, (binding) => {
 		const next = { ...binding };
 		if (flex) next.flex = flex;
 		else delete next.flex;
@@ -220,8 +376,12 @@ export function setFlexBinding(agentDir: string, key: string, flex: FlexBinding 
 	});
 }
 
-export function setPinBinding(agentDir: string, key: string, pin: PinBinding | null): void {
-	setModelBinding(agentDir, key, (binding) => {
+export function setPinBinding(
+	agentDir: string,
+	key: string,
+	pin: PinBinding | null,
+): string | undefined {
+	return setModelBinding(agentDir, key, (binding) => {
 		const next = { ...binding };
 		if (pin) next.pin = pin;
 		else delete next.pin;
@@ -234,8 +394,8 @@ export function fallbackRouting(agentDir: string): FallbackRouting {
 	return loadState(agentDir).fallback === "openrouter" ? "openrouter" : "same-provider";
 }
 
-export function setFallbackRouting(agentDir: string, routing: FallbackRouting): void {
-	saveState(agentDir, { ...loadState(agentDir), fallback: routing });
+export function setFallbackRouting(agentDir: string, routing: FallbackRouting): string | undefined {
+	return saveState(agentDir, { ...loadState(agentDir), fallback: routing });
 }
 
 export function describeFallbackRouting(routing: FallbackRouting): string {
@@ -324,17 +484,20 @@ const DEFAULT_TURN_MIX: TurnMix = {
 	output: 1_000,
 };
 
-let turnMixCache: { at: number; mix: TurnMix; turns: number } | undefined;
+export interface TurnMixResolution {
+	mix: TurnMix;
+	turns?: number;
+	source: string;
+}
+
+let turnMixCache: { at: number; value: TurnMixResolution } | undefined;
+let turnMixScan: Promise<TurnMixResolution> | undefined;
 
 /** Optional user override: `turnMix` in openrouter.json (or the legacy flex.json). */
 function turnMixOverride(agentDir: string): TurnMix | undefined {
-	for (const file of [STATE_FILE, LEGACY_FLEX_FILE]) {
-		const parsed = readJson(join(agentDir, file));
-		if (!isRecord(parsed)) continue;
-		const override = parseTurnMix(parsed.turnMix);
-		if (override) return override;
-	}
-	return undefined;
+	const fromState = loadState(agentDir).turnMix;
+	if (fromState) return fromState;
+	return parseTurnMix(readJson(join(agentDir, LEGACY_FLEX_FILE))?.turnMix);
 }
 
 function median(values: number[]): number {
@@ -351,19 +514,25 @@ function mean(values: number[]): number {
 /**
  * Scan Pi session files for per-turn token usage and derive a representative
  * agentic turn: median uncached input, cache-read and output; mean cache-write
- * (sparse but large when a session cold-starts).
+ * (sparse but large when a session cold-starts). Asynchronous and size-capped, so it
+ * never stalls the UI thread.
  */
-function scanTurnMix(agentDir: string): { mix: TurnMix; turns: number } | undefined {
+async function scanTurnMix(agentDir: string): Promise<{ mix: TurnMix; turns: number } | undefined> {
 	const sessionsDir = join(agentDir, "sessions");
 	try {
 		const files: { path: string; mtime: number }[] = [];
-		for (const entry of readdirSync(sessionsDir, { withFileTypes: true })) {
+		for (const entry of await readdir(sessionsDir, { withFileTypes: true })) {
 			if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
 			const dir = join(sessionsDir, entry.name);
-			for (const file of readdirSync(dir)) {
+			for (const file of await readdir(dir)) {
 				if (!file.endsWith(".jsonl")) continue;
 				const path = join(dir, file);
-				files.push({ path, mtime: statSync(path).mtimeMs });
+				try {
+					const info = await stat(path);
+					if (info.size <= TURN_MIX_MAX_FILE_BYTES) files.push({ path, mtime: info.mtimeMs });
+				} catch {
+					// A session file removed mid-scan is simply skipped.
+				}
 			}
 		}
 		// Recent sessions resemble current usage patterns most closely.
@@ -375,7 +544,7 @@ function scanTurnMix(agentDir: string): { mix: TurnMix; turns: number } | undefi
 		for (const file of files.slice(0, TURN_MIX_MAX_FILES)) {
 			let content: string;
 			try {
-				content = readFileSync(file.path, "utf8");
+				content = await readFile(file.path, "utf8");
 			} catch {
 				continue;
 			}
@@ -417,20 +586,45 @@ function scanTurnMix(agentDir: string): { mix: TurnMix; turns: number } | undefi
 	}
 }
 
-/** Resolve the representative turn: state-file override, then session history, then a default. */
-export function resolveTurnMix(
-	agentDir: string,
-	options: { refresh?: boolean } = {},
-): { mix: TurnMix; turns?: number; source: string } {
+/**
+ * The representative turn when it is available without scanning: the state-file override,
+ * or a fresh cached scan. `undefined` means a scan is needed first.
+ */
+export function peekTurnMix(agentDir: string): TurnMixResolution | undefined {
 	const override = turnMixOverride(agentDir);
 	if (override) return { mix: override, source: STATE_FILE };
-	if (!options.refresh && turnMixCache && Date.now() - turnMixCache.at < TURN_MIX_TTL_MS) {
-		return { mix: turnMixCache.mix, turns: turnMixCache.turns, source: "your sessions" };
+	if (turnMixCache && Date.now() - turnMixCache.at < TURN_MIX_TTL_MS) return turnMixCache.value;
+	return undefined;
+}
+
+/** Resolve the representative turn: state-file override, then session history, then a default. */
+export async function resolveTurnMix(
+	agentDir: string,
+	options: { refresh?: boolean } = {},
+): Promise<TurnMixResolution> {
+	if (!options.refresh) {
+		const ready = peekTurnMix(agentDir);
+		if (ready) return ready;
 	}
-	const scanned = scanTurnMix(agentDir);
-	if (scanned) {
-		turnMixCache = { at: Date.now(), ...scanned };
-		return { mix: scanned.mix, turns: scanned.turns, source: "your sessions" };
-	}
-	return { mix: DEFAULT_TURN_MIX, source: "built-in default" };
+	const override = turnMixOverride(agentDir);
+	if (override) return { mix: override, source: STATE_FILE };
+
+	// Concurrent callers share one scan.
+	turnMixScan ??= scanTurnMix(agentDir)
+		.then((scanned): TurnMixResolution => {
+			const value: TurnMixResolution = scanned
+				? { mix: scanned.mix, turns: scanned.turns, source: "your sessions" }
+				: { mix: DEFAULT_TURN_MIX, source: "built-in default" };
+			turnMixCache = { at: Date.now(), value };
+			return value;
+		})
+		.finally(() => {
+			turnMixScan = undefined;
+		});
+	return turnMixScan;
+}
+
+/** Drop the cached scan, for tests and `/flex mix refresh`. */
+export function clearTurnMixCache(): void {
+	turnMixCache = undefined;
 }

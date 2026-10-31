@@ -7,7 +7,9 @@
  *   while an endpoint is pinned, because the two constraints can contradict each other.
  * - With flex auto, the provider pin is active and constrains which flex endpoint serves.
  * - During a shed cooldown the request continues at standard rates; the same-provider
- *   route is preferred, ordered through the pin when one is active.
+ *   route is preferred, ordered through the pin when one is active. A cooldown never
+ *   widens a pin that forbids fallbacks: the sibling is tried first only when the pin
+ *   already allows its provider.
  */
 
 import {
@@ -37,6 +39,11 @@ export interface RouteInputs {
 	endpoints?: Endpoint[];
 }
 
+/** A pin that must not be widened: `only`, or `prefer` with fallbacks declined. */
+export function isLockedPin(pin: PinBinding | undefined): boolean {
+	return Boolean(pin) && (pin?.mode === "only" || pin?.allowFallbacks === false);
+}
+
 /** Provider routing for a pin, or `undefined` when no pin applies. */
 export function pinRouting(pin: PinBinding | undefined): PlannedRoute["provider"] | undefined {
 	if (!pin || pin.providers.length === 0) return undefined;
@@ -48,9 +55,11 @@ export function pinRouting(pin: PinBinding | undefined): PlannedRoute["provider"
 /**
  * The flex endpoint a request is expected to use, when that is knowable.
  *
- * A pinned endpoint is known. Auto routing with a provider pin resolves to the cheapest
- * flex endpoint among the pinned providers. Auto without a pin leaves the choice to
- * OpenRouter, so pricing stays unknown and the catalog cost remains an upper bound.
+ * A pinned endpoint is known. Auto routing with a provider pin sends `provider.order` in
+ * pin order, so the first pinned provider that operates a flex endpoint serves it (its
+ * cheapest one); this is the endpoint cost accounting and the advisor assume. Auto
+ * without a pin leaves the choice to OpenRouter, so pricing stays unknown and the
+ * catalog cost remains an upper bound.
  */
 export function effectiveFlexEndpoint(
 	flex: FlexBinding | undefined,
@@ -66,13 +75,21 @@ export function effectiveFlexEndpoint(
 		return { tag: flex.endpoint, pricing: flex.pricing };
 	}
 	if (!pin) return undefined;
-	const allowed = new Set(pin.providers);
-	return flexList.find((endpoint) => allowed.has(providerSlugOf(endpoint.tag)));
+	for (const provider of pin.providers) {
+		// `flexList` is cheapest first, so the first match is the provider's cheapest.
+		const match = flexList.find((endpoint) => providerSlugOf(endpoint.tag) === provider);
+		if (match) return match;
+	}
+	return undefined;
 }
 
-/** Order a cooldown's provider list so the sibling provider comes first, keeping the pin. */
+/**
+ * Order a cooldown's provider list so the sibling provider comes first, keeping the pin.
+ * A sibling outside the pin is ignored: it would route to a provider the pin excludes.
+ */
 function siblingFirst(pin: PinBinding, siblingTag: string): PlannedRoute["provider"] {
 	const provider = providerSlugOf(siblingTag);
+	if (!pin.providers.includes(provider)) return pinRouting(pin);
 	const rest = pin.providers.filter((entry) => entry !== provider);
 	if (pin.mode === "only") {
 		return { only: pin.providers, order: [provider, ...rest], allow_fallbacks: false };
@@ -81,7 +98,7 @@ function siblingFirst(pin: PinBinding, siblingTag: string): PlannedRoute["provid
 }
 
 function planShed(
-	flex: FlexBinding | undefined,
+	flex: FlexBinding,
 	pin: PinBinding | undefined,
 	routing: FallbackRouting,
 	endpoints: Endpoint[] | undefined,
@@ -92,19 +109,24 @@ function planShed(
 	}
 
 	let sibling: string | undefined;
-	if (flex?.endpoint) sibling = siblingOfTag(flex.endpoint);
+	if (flex.endpoint) sibling = siblingOfTag(flex.endpoint);
 	else {
 		const effective = effectiveFlexEndpoint(flex, pin, endpoints);
 		if (effective) sibling = standardSiblingTag(effective) ?? siblingOfTag(effective.tag);
 	}
-	if (!sibling) {
-		sibling = cheapestFlexSibling(endpoints ?? []);
-	}
+	// Without a pin any flex provider's sibling will do; with one, only a pinned provider's
+	// sibling is a valid stand-in, so no sibling is invented from outside the pin.
+	if (!sibling && !pin) sibling = cheapestFlexSibling(endpoints ?? []);
 	if (!sibling) return { shed: true, provider: pinRouting(pin) };
 
-	// An endpoint pin keeps the provider affinity the endpoint itself expressed.
-	if (!flex || flex.endpoint)
-		return { shed: true, provider: { order: [sibling], allow_fallbacks: true } };
+	if (flex.endpoint) {
+		// The endpoint chose the provider. A pin that forbids fallbacks keeps that choice
+		// strict through the cooldown; otherwise OpenRouter may route around a full sibling.
+		return {
+			shed: true,
+			provider: { order: [sibling], allow_fallbacks: !isLockedPin(pin) },
+		};
+	}
 	if (pin) return { shed: true, provider: siblingFirst(pin, sibling) };
 	return { shed: true, provider: { order: [sibling], allow_fallbacks: true } };
 }

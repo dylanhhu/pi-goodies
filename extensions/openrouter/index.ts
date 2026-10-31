@@ -35,8 +35,23 @@
  *   Prefix with `session` (or `temp`) to scope any pin to this session only.
  *
  * State: ~/.pi/agent/openrouter.json, keyed by `<provider>:<model id>`, holding
- * `{ flex?, pin? }` per model plus `turnMix` and `fallback`. The first load migrates
- * `flex.json` and `openrouter-pin.json`; the legacy files are left untouched.
+ * `{ flex?, pin? }` per model plus `turnMix` and `fallback`. The legacy `flex.json` and
+ * `openrouter-pin.json` are imported only when this file does not exist, and are left
+ * untouched. An unreadable or invalid file is never replaced by them: the last good state
+ * stays in force, a copy of the bad file is saved, and the problem is reported. Writes are
+ * atomic, reload on outside changes, and report failure instead of hiding it.
+ *
+ * Safety:
+ * - Shed detection runs only for requests that actually carried the flex tier, and only
+ *   while a flex binding still exists, so a pin-only model's 429 is an ordinary error.
+ * - The extension's own continuation of a shed attempt (which bypasses Pi's retry budget)
+ *   is capped; past the cap a shed sets the cooldown and Pi's bounded retry takes over.
+ * - A cooldown never widens a pin that forbids fallbacks.
+ * - An explicit `service_tier` in the request body replaces the flex binding but not the
+ *   provider pin. A request for a different model, or a body that is not chat-completions
+ *   shaped, is not routed; the latter warns, since it means a pin is not in effect.
+ * - Handler bodies are guarded: a bug here is reported once and the event proceeds
+ *   unmodified, so the extension cannot break a request, a turn, or the session.
  *
  * Billing: the catalog price is the standard-tier price, so while a known flex endpoint
  * serves a request, that message's cost is recomputed from the endpoint's published
@@ -100,6 +115,7 @@ import {
 	describeFallbackRouting,
 	fallbackRouting,
 	loadState,
+	peekTurnMix,
 	putSessionPin,
 	resolvePin,
 	resolveTurnMix,
@@ -110,6 +126,7 @@ import {
 	setFallbackRouting,
 	setFlexBinding,
 	setPinBinding,
+	stateHealth,
 } from "./state.ts";
 import type {
 	Endpoint,
@@ -130,10 +147,23 @@ const STATUS_KEY = "openrouter";
 /** Keys owned by the pre-merge extensions, cleared so a reload leaves no stale text. */
 const LEGACY_STATUS_KEYS = ["flex", "pin"];
 
-/** The endpoint of the request currently in flight, for cost accounting. */
-let inFlight: { key: string; pricing: EndpointPricing; at: number } | undefined;
-/** The model whose request currently carries flex routing, for fallback detection. */
-let inFlightFlex: { key: string; at: number } | undefined;
+/**
+ * How long a request's cost and shed bookkeeping stays valid. Flex requests queue, so a
+ * response can legitimately arrive many minutes after the request left; this only bounds
+ * state that a request abandoned without a `message_end`.
+ */
+const REQUEST_STATE_TTL_MS = 30 * 60_000;
+
+/**
+ * The extension may relabel a shed attempt and continue it itself, bypassing Pi's retry
+ * budget. That bypass is capped: past this many per window, a shed only sets the cooldown
+ * and the error goes to Pi's own bounded retry.
+ */
+const MAX_SHED_CONTINUATIONS = 2;
+const SHED_WINDOW_MS = 5 * 60_000;
+
+/** A shed's provider lookup must not hold up the message for a slow catalog. */
+const FALLBACK_LOOKUP_TIMEOUT_MS = 3_000;
 
 /**
  * How long flex stays shed after a rate-limit or capacity error. The cooldown covers
@@ -163,16 +193,21 @@ const FALLBACK_ERROR_PATTERN = new RegExp(
 	"i",
 );
 
-/** Models currently shed to the standard tier, keyed like bindings. Transient, in memory. */
-const fallbacks = new Map<string, { until: number; reason: string; endpoint?: string }>();
+type Shed = { until: number; reason: string; endpoint?: string };
 
-/** Last advisor result per model, so the status line can show it without re-fetching. */
-const advice = new Map<string, FlexAdvice>();
-/** The advisory warning is shown once per session; later bad models get only the status note. */
-let advisedThisSession = false;
-/** Invalidates background advisor checks across session boundaries. */
-let sessionGeneration = 0;
-const adviceInFlight = new Set<string>();
+/** Resolve with `undefined` if `promise` has not settled within `ms`; it keeps running. */
+async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timeout = new Promise<undefined>((resolve) => {
+		timer = setTimeout(() => resolve(undefined), ms);
+		timer.unref?.();
+	});
+	try {
+		return await Promise.race([promise, timeout]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
 
 /** The triggering provider error, trimmed to one line for the notification and status. */
 function fallbackReason(error: string | undefined): string | undefined {
@@ -187,9 +222,6 @@ function fallbackReason(error: string | undefined): string | undefined {
  * with wording it does not match; `agent_before_settle` then continues it directly.
  */
 const FALLBACK_STOP_MESSAGE = "Flex capacity shed; continuing at standard rates";
-
-/** The shed attempt whose standard-tier continuation is pending at the settle boundary. */
-let pendingContinuation: { at: number; errorText: string } | undefined;
 
 /** Entry of the shed assistant message, so the continuation can omit it from context. */
 function shedAttemptEntryId(ctx: ExtensionContext, errorText: string): string | undefined {
@@ -284,7 +316,8 @@ interface ParsedPinArgs {
 function parsePinArgs(args: string): ParsedPinArgs {
 	let scope: PinScope = "model";
 	let rest = args.trim();
-	const scopeMatch = /^(session|temp|temporarily)\b[\s,]*/i.exec(rest);
+	// A keyword counts only as a whole word: `temp-ai` is a provider slug, not `temp`.
+	const scopeMatch = /^(session|temp|temporarily)(?![^\s,])[\s,]*/i.exec(rest);
 	if (scopeMatch) {
 		scope = "session";
 		rest = rest.slice(scopeMatch[0].length);
@@ -292,7 +325,7 @@ function parsePinArgs(args: string): ParsedPinArgs {
 
 	let mode: PinMode = "only";
 	let allowFallbacks = false;
-	const modeMatch = /^(only|prefer|soft|strict|ordered)\b[\s,]*/i.exec(rest);
+	const modeMatch = /^(only|prefer|soft|strict|ordered)(?![^\s,])[\s,]*/i.exec(rest);
 	if (modeMatch) {
 		const keyword = modeMatch[1].toLowerCase();
 		// `strict` and `ordered` are prefer pins that decline fallbacks.
@@ -302,12 +335,12 @@ function parsePinArgs(args: string): ParsedPinArgs {
 	}
 	// `prefer strict` and `prefer no-fallbacks` say the same thing as `strict`.
 	if (mode === "prefer") {
-		const modifier = /^(no-?fallbacks?|strict)\b[\s,]*/i.exec(rest);
+		const modifier = /^(no-?fallbacks?|strict)(?![^\s,])[\s,]*/i.exec(rest);
 		if (modifier) {
 			allowFallbacks = false;
 			rest = rest.slice(modifier[0].length);
 		} else {
-			const allow = /^(fallbacks?|with-?fallbacks?)\b[\s,]*/i.exec(rest);
+			const allow = /^(fallbacks?|with-?fallbacks?)(?![^\s,])[\s,]*/i.exec(rest);
 			if (allow) rest = rest.slice(allow[0].length);
 		}
 	}
@@ -316,6 +349,94 @@ function parsePinArgs(args: string): ParsedPinArgs {
 
 export default function (pi: ExtensionAPI) {
 	const agentDir = getAgentDir();
+
+	// Transient request state lives in the factory, so every extension instance (and every
+	// test) starts clean.
+	/** The endpoint of the request currently in flight, for cost accounting. */
+	let inFlight: { key: string; pricing: EndpointPricing; at: number } | undefined;
+	/** The model whose request carries the flex tier, for fallback detection. */
+	let inFlightFlex: { key: string; at: number } | undefined;
+	/** The shed attempt whose standard-tier continuation is pending at the settle boundary. */
+	let pendingContinuation: { at: number; errorText: string } | undefined;
+	/** Models currently shed to the standard tier, keyed like bindings. */
+	const fallbacks = new Map<string, Shed>();
+	/** Times the extension itself continued a shed attempt, per model, for the cap. */
+	const shedContinuations = new Map<string, number[]>();
+	/** Last advisor result per model, so the status line can show it without re-fetching. */
+	const advice = new Map<string, FlexAdvice>();
+	/** The advisory warning is shown once per session; later bad models get only the status note. */
+	let advisedThisSession = false;
+	/** Invalidates background advisor checks across session boundaries. */
+	let sessionGeneration = 0;
+	const adviceInFlight = new Set<string>();
+	/** One-time warnings per session, so a recurring condition does not flood the UI. */
+	const warned = new Set<string>();
+
+	/** Warn once per session per `id`; the extension never repeats the same complaint. */
+	const warnOnce = (ctx: ExtensionContext, id: string, message: string): void => {
+		if (warned.has(id)) return;
+		warned.add(id);
+		if (ctx.hasUI) ctx.ui.notify(message, "warning");
+	};
+
+	/** Tell the user a change did not reach disk, so it is not mistaken for a saved one. */
+	const reportPersist = (ctx: ExtensionContext, error: string | undefined): void => {
+		if (!error || !ctx.hasUI) return;
+		ctx.ui.notify(
+			`Could not save ${STATE_FILE}: ${error}\nThe change applies to this session only and will be lost on restart.`,
+			"error",
+		);
+	};
+
+	/** Say so when `openrouter.json` cannot be used, since pins and flex would be missing. */
+	const reportStateHealth = (ctx: ExtensionContext): void => {
+		const health = stateHealth(agentDir);
+		if (!health) return;
+		const backup = health.backupPath ? `\nA copy was saved to ${health.backupPath}.` : "";
+		const effect = health.usingLastGood
+			? "Continuing with the last good settings."
+			: "Pins and flex bindings are NOT in effect until it is repaired.";
+		warnOnce(
+			ctx,
+			"state-health",
+			`${STATE_FILE} is ${health.problem} (${health.detail}). ${effect}${backup}\nThe file is left as-is; fix or delete it, or run /pin or /flex to write a fresh one.`,
+		);
+	};
+
+	const reportFailure = (ctx: ExtensionContext, name: string, error: unknown): void => {
+		warnOnce(
+			ctx,
+			`error:${name}`,
+			`OpenRouter extension error in ${name}: ${error instanceof Error ? error.message : String(error)}\nThe event continued without extension routing.`,
+		);
+	};
+
+	/**
+	 * Run an event handler body so that a bug here can never break a request, a turn, or
+	 * the session: the failure is reported once and the event proceeds unmodified.
+	 */
+	const guarded = <R>(name: string, ctx: ExtensionContext, fn: () => R): R | undefined => {
+		try {
+			return fn();
+		} catch (error) {
+			reportFailure(ctx, name, error);
+			return undefined;
+		}
+	};
+
+	const guardedAsync = async <R>(
+		name: string,
+		ctx: ExtensionContext,
+		fn: () => Promise<R>,
+	): Promise<R | undefined> => {
+		try {
+			return await fn();
+		} catch (error) {
+			reportFailure(ctx, name, error);
+			return undefined;
+		}
+	};
+
 	/** Latest UI context, so the countdown can refresh the footer between events. */
 	let statusCtx: ExtensionContext | undefined;
 	/** One-second ticker, running only while the current model is shed to standard rates. */
@@ -387,8 +508,13 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setStatus(STATUS_KEY, text);
 		const model = ctx.model;
 		const shed = model ? fallbacks.get(bindingKey(model)) : undefined;
-		if (shed && Date.now() < shed.until) countdown ??= setInterval(tick, 1_000);
-		else stopCountdown();
+		if (shed && Date.now() < shed.until) {
+			if (!countdown) {
+				countdown = setInterval(tick, 1_000);
+				// The ticker only refreshes the footer; it must never keep the process alive.
+				countdown.unref?.();
+			}
+		} else stopCountdown();
 	};
 
 	/**
@@ -406,8 +532,21 @@ export default function (pi: ExtensionAPI) {
 			advice.delete(key);
 			return;
 		}
+		const turn = peekTurnMix(agentDir);
+		if (!turn) {
+			// The blend comes from scanning session history, which is asynchronous. Compare
+			// once it is ready rather than advising on a placeholder.
+			const generation = sessionGeneration;
+			void resolveTurnMix(agentDir).then(() => {
+				if (generation !== sessionGeneration) return;
+				guarded("flex advisor", ctx, () => {
+					recordAdvice(ctx, model, endpoints);
+					syncStatus(ctx);
+				});
+			});
+			return;
+		}
 		const { pin } = resolvePin(agentDir, model);
-		const turn = resolveTurnMix(agentDir);
 		const result = assessFlex(binding.flex, pin, endpoints, turn.mix);
 		if (!result) {
 			advice.delete(key);
@@ -430,10 +569,11 @@ export default function (pi: ExtensionAPI) {
 		if (adviceInFlight.has(key)) return;
 		if (!bindingFor(agentDir, model)?.flex) return;
 		const generation = sessionGeneration;
-		const apiKey = await ctx.modelRegistry.getApiKeyForProvider("openrouter");
-		if (!apiKey || generation !== sessionGeneration) return;
+		// Claim the slot before the first await, so concurrent callers cannot both proceed.
 		adviceInFlight.add(key);
 		try {
+			const apiKey = await ctx.modelRegistry.getApiKeyForProvider("openrouter");
+			if (!apiKey || generation !== sessionGeneration) return;
 			const { endpoints } = await fetchEndpoints(model, apiKey);
 			if (generation !== sessionGeneration) return;
 			recordAdvice(ctx, model, endpoints);
@@ -491,11 +631,17 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// The endpoint cache has usually expired by the time capacity runs out; one list
-		// request per shed is cheap next to the wasted flex attempt it replaces.
-		const apiKey = await ctx.modelRegistry.getApiKeyForProvider("openrouter");
-		if (!apiKey) return undefined;
+		// request per shed is cheap next to the wasted flex attempt it replaces. The wait is
+		// bounded: the lookup keeps running and fills the cache, which the next request's
+		// plan reads, so a slow catalog never holds up the message itself.
 		try {
-			return siblingOf((await fetchEndpoints(model, apiKey)).endpoints);
+			const apiKey = await withTimeout(
+				ctx.modelRegistry.getApiKeyForProvider("openrouter"),
+				FALLBACK_LOOKUP_TIMEOUT_MS,
+			);
+			if (!apiKey) return undefined;
+			const fetched = await withTimeout(fetchEndpoints(model, apiKey), FALLBACK_LOOKUP_TIMEOUT_MS);
+			return fetched ? siblingOf(fetched.endpoints) : undefined;
 		} catch {
 			return undefined;
 		}
@@ -554,24 +700,45 @@ export default function (pi: ExtensionAPI) {
 	 * One handler owns `service_tier` and `provider`. The plan applies them together, so a
 	 * tier and a provider list can no longer be written by different owners.
 	 */
-	pi.on("before_provider_request", (event, ctx) => {
+	pi.on("before_provider_request", (event, ctx) =>
+		guarded("request planning", ctx, () => planRequest(event.payload, ctx)),
+	);
+
+	const planRequest = (payload: unknown, ctx: ExtensionContext): unknown => {
 		inFlight = undefined;
 		inFlightFlex = undefined;
 		const model = ctx.model;
 		if (model?.provider !== "openrouter") return;
-
-		const payload = event.payload;
 		if (!isRecord(payload)) return;
 		const body = payload;
-		// Only chat-completions-shaped bodies carry provider routing and service tiers.
-		if (!Array.isArray(body.messages)) return;
-		// An explicit tier from models.json or samplingParams wins.
-		if (body.service_tier !== undefined) return;
+
+		// Pi builds the request body with `model: model.id`. A different id means this request
+		// is for another model (a compaction or summary call), which the selected model's
+		// binding must not route.
+		if (typeof body.model === "string" && body.model !== model.id) return;
 
 		const key = bindingKey(model);
 		const binding = bindingFor(agentDir, model);
 		const { pin } = resolvePin(agentDir, model);
 		const now = Date.now();
+		// A state file that went bad mid-session means the pin is not in effect; say so once.
+		reportStateHealth(ctx);
+
+		// Only chat-completions-shaped bodies carry provider routing and service tiers. A
+		// pin is a trust lock, so a body the extension cannot route must not pass silently.
+		if (!Array.isArray(body.messages)) {
+			if (binding?.flex || pin) {
+				warnOnce(
+					ctx,
+					`unroutable:${key}`,
+					`${model.id} has a flex binding or provider pin, but its request is not chat-completions shaped, so OpenRouter routing is NOT being applied.`,
+				);
+			}
+			return;
+		}
+		// An explicit tier from models.json or samplingParams wins over the flex binding, but
+		// the provider pin still applies: a tier setting must not silently drop a lock.
+		const explicitTier = body.service_tier !== undefined;
 
 		let fallback = fallbacks.get(key);
 		if (fallback && now >= fallback.until) {
@@ -581,7 +748,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const plan = planRoute({
-			binding,
+			binding: explicitTier ? undefined : binding,
 			pin,
 			fallback,
 			routing: fallbackRouting(agentDir),
@@ -601,20 +768,27 @@ export default function (pi: ExtensionAPI) {
 			next.provider = routing;
 		}
 
-		if (!plan.shed) {
-			inFlightFlex = { key, at: now };
-			if (plan.pricing) inFlight = { key, pricing: plan.pricing, at: now };
-		}
+		// Shed detection is armed only for a request that actually carries the flex tier. A
+		// pin-only request that fails with a 429 is an ordinary error, not a flex shed.
+		if (plan.serviceTier && !plan.shed) inFlightFlex = { key, at: now };
+		if (!plan.shed && plan.pricing) inFlight = { key, pricing: plan.pricing, at: now };
 		return next;
-	});
+	};
 
 	/**
 	 * Shed flex when the request it served was rate limited, and otherwise rebuild the
 	 * message cost from the serving endpoint's published prices. Pi bills the catalog
 	 * price, which is the standard tier.
 	 */
-	pi.on("message_end", async (event, ctx) => {
-		const message = event.message as unknown as {
+	pi.on("message_end", (event, ctx) =>
+		guardedAsync("message handling", ctx, () => handleMessageEnd(event.message, ctx)),
+	);
+
+	const handleMessageEnd = async (
+		eventMessage: unknown,
+		ctx: ExtensionContext,
+	): Promise<MessageEndEventResult | undefined> => {
+		const message = eventMessage as {
 			role?: string;
 			provider?: string;
 			model?: string;
@@ -642,32 +816,49 @@ export default function (pi: ExtensionAPI) {
 
 		// Warming, summary, and compaction requests for other models must not inherit this state.
 		const key = `openrouter:${message.model}`;
-		const current = pendingFlex && Date.now() - pendingFlex.at < 120_000 && pendingFlex.key === key;
+		const current =
+			pendingFlex !== undefined &&
+			Date.now() - pendingFlex.at < REQUEST_STATE_TTL_MS &&
+			pendingFlex.key === key;
 		if (current && message.stopReason === "error") {
 			const reason = fallbackReason(message.errorMessage);
-			if (reason) {
-				const endpoint = await standardFallbackEndpoint(ctx, message.model ?? "");
-				fallbacks.set(key, { until: Date.now() + FALLBACK_COOLDOWN_MS, reason, endpoint });
-				if (ctx.hasUI) {
-					const seconds = FALLBACK_COOLDOWN_MS / 1000;
-					const via = endpoint ?? "OpenRouter default routing";
-					ctx.ui.notify(
-						`Flex rate limited: ${reason}\nServing ${message.model} at standard rates for ${seconds}s via ${via}, then retrying flex`,
-						"warning",
-					);
-					syncStatus(ctx);
-				}
-				// Pi's own retry would back off first; relabel the attempt and continue it
-				// at standard rates at the settle boundary instead.
-				pendingContinuation = { at: Date.now(), errorText: FALLBACK_STOP_MESSAGE };
-				return {
-					message: { ...message, errorMessage: FALLBACK_STOP_MESSAGE },
-				} as unknown as MessageEndEventResult;
+			// Shed only while flex is still wanted: `/flex off` while the request was in flight
+			// leaves an ordinary error for Pi to handle.
+			const modelRef: ModelLike = { provider: "openrouter", id: message.model ?? "" };
+			if (!reason || !bindingFor(agentDir, modelRef)?.flex) return;
+
+			const endpoint = await standardFallbackEndpoint(ctx, modelRef.id);
+			// The lookup awaited; flex may have been turned off meanwhile.
+			if (!bindingFor(agentDir, modelRef)?.flex) return;
+			fallbacks.set(key, { until: Date.now() + FALLBACK_COOLDOWN_MS, reason, endpoint });
+
+			// Relabelling the error and continuing it ourselves skips Pi's retry budget, so it
+			// is capped. Past the cap the cooldown is still set, and Pi's own bounded retry
+			// (backoff included) sends the next attempt at standard rates.
+			const now = Date.now();
+			const recent = (shedContinuations.get(key) ?? []).filter((at) => now - at < SHED_WINDOW_MS);
+			const continueHere = recent.length < MAX_SHED_CONTINUATIONS;
+			if (continueHere) recent.push(now);
+			shedContinuations.set(key, recent);
+
+			if (ctx.hasUI) {
+				const seconds = FALLBACK_COOLDOWN_MS / 1000;
+				const via = endpoint ?? "OpenRouter default routing";
+				const tail = continueHere ? "" : "\nRepeated sheds: leaving the retry to Pi's backoff";
+				ctx.ui.notify(
+					`Flex rate limited: ${reason}\nServing ${message.model} at standard rates for ${seconds}s via ${via}, then retrying flex${tail}`,
+					"warning",
+				);
+				syncStatus(ctx);
 			}
-			return;
+			if (!continueHere) return;
+			pendingContinuation = { at: Date.now(), errorText: FALLBACK_STOP_MESSAGE };
+			return {
+				message: { ...message, errorMessage: FALLBACK_STOP_MESSAGE },
+			} as unknown as MessageEndEventResult;
 		}
 
-		if (!pending || Date.now() - pending.at > 120_000) return;
+		if (!pending || Date.now() - pending.at > REQUEST_STATE_TTL_MS) return;
 		if (pending.key !== key) return;
 		const usage = message.usage;
 		if (!usage?.cost) return;
@@ -676,7 +867,7 @@ export default function (pi: ExtensionAPI) {
 			usage: { ...usage, cost: costFromPricing(pending.pricing, usage) },
 		};
 		return { message: replacement } as unknown as MessageEndEventResult;
-	});
+	};
 
 	/**
 	 * Serve a shed flex request at the standard tier without Pi's retry backoff. The failed
@@ -686,12 +877,14 @@ export default function (pi: ExtensionAPI) {
 		const pending = pendingContinuation;
 		pendingContinuation = undefined;
 		if (!pending || Date.now() - pending.at > 30_000) return;
-		const targetId = shedAttemptEntryId(ctx, pending.errorText);
-		if (!targetId) return;
-		return {
-			entries: [...event.entries, { type: "context_edit", targetId, replacement: null }],
-			continue: true,
-		};
+		return guarded("settle", ctx, () => {
+			const targetId = shedAttemptEntryId(ctx, pending.errorText);
+			if (!targetId) return undefined;
+			return {
+				entries: [...event.entries, { type: "context_edit" as const, targetId, replacement: null }],
+				continue: true,
+			};
+		});
 	});
 
 	/** Flex capacity is not prioritised for warming, and most flex endpoints do not cache. */
@@ -703,19 +896,26 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", (_event, ctx) => {
-		sessionGeneration += 1;
-		advisedThisSession = false;
-		advice.clear();
-		restoreSessionPins(ctx);
-		if (ctx.hasUI) {
-			for (const key of LEGACY_STATUS_KEYS) ctx.ui.setStatus(key, undefined);
-		}
-		syncStatus(ctx);
-		ensureAdvice(ctx, ctx.model);
+		guarded("session start", ctx, () => {
+			sessionGeneration += 1;
+			advisedThisSession = false;
+			advice.clear();
+			warned.clear();
+			shedContinuations.clear();
+			restoreSessionPins(ctx);
+			if (ctx.hasUI) {
+				for (const key of LEGACY_STATUS_KEYS) ctx.ui.setStatus(key, undefined);
+			}
+			reportStateHealth(ctx);
+			syncStatus(ctx);
+			ensureAdvice(ctx, ctx.model);
+		});
 	});
 	pi.on("model_select", (_event, ctx) => {
-		syncStatus(ctx);
-		ensureAdvice(ctx, ctx.model);
+		guarded("model select", ctx, () => {
+			syncStatus(ctx);
+			ensureAdvice(ctx, ctx.model);
+		});
 	});
 	pi.on("session_shutdown", () => {
 		sessionGeneration += 1;
@@ -724,8 +924,11 @@ export default function (pi: ExtensionAPI) {
 		adviceInFlight.clear();
 		stopCountdown();
 		statusCtx = undefined;
+		inFlight = undefined;
+		inFlightFlex = undefined;
 		pendingContinuation = undefined;
 		fallbacks.clear();
+		shedContinuations.clear();
 		clearSessionPins();
 	});
 
@@ -748,9 +951,25 @@ export default function (pi: ExtensionAPI) {
 	): void => {
 		const modelRef: ModelLike = { provider: "openrouter", id: model.id };
 		const key = bindingKey(modelRef);
+
+		// Flex auto must be able to honor the pin, or the request would carry the flex tier
+		// to providers that have no flex endpoint. Every route into auto passes through here,
+		// so `/flex on`, the picker, and `/flex scan` cannot disagree. Turning flex off, or
+		// pinning an endpoint (which owns `provider.only`), never conflicts.
+		if (binding && !binding.endpoint && endpoints) {
+			const { pin: activePin } = resolvePin(agentDir, modelRef);
+			const conflict = activePin
+				? pinBlocksFlex(activePin, endpoints, modelSlug(model.id))
+				: undefined;
+			if (conflict) {
+				ctx.ui.notify(conflict, "warning");
+				return;
+			}
+		}
+
 		// An explicit /flex change supersedes a fallback the extension chose.
 		fallbacks.delete(key);
-		setFlexBinding(agentDir, key, binding);
+		reportPersist(ctx, setFlexBinding(agentDir, key, binding));
 		if (!binding) {
 			advice.delete(key);
 			ctx.ui.notify(`Flex off: ${model.id} uses standard routing`, "info");
@@ -858,7 +1077,7 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify("No scoped models configured; scanning the current model only", "info");
 		}
 
-		const turn = resolveTurnMix(agentDir);
+		const turn = await resolveTurnMix(agentDir);
 		const rows = await mapLimit(targets, 6, async (model) => {
 			const { endpoints, error, slug, resolvedFrom } = await fetchEndpoints(model, apiKey, options);
 			return {
@@ -1003,7 +1222,8 @@ export default function (pi: ExtensionAPI) {
 			return matches.length > 0 ? matches : null;
 		},
 		handler: async (rawArgs, ctx) => {
-			const args = rawArgs.trim();
+			// Subcommands and endpoint tags are lowercase, so `/flex OFF` means `/flex off`.
+			const args = rawArgs.trim().toLowerCase();
 
 			// Model-independent: usage is the same for every model.
 			if (isHelpArg(args)) {
@@ -1013,7 +1233,7 @@ export default function (pi: ExtensionAPI) {
 
 			// Model-independent: the blend applies to every comparison.
 			if (args === "mix" || args.startsWith("mix ")) {
-				const turn = resolveTurnMix(agentDir, { refresh: args === "mix refresh" });
+				const turn = await resolveTurnMix(agentDir, { refresh: args === "mix refresh" });
 				const mixLines = [
 					`Turn mix (${turn.source}${turn.turns !== undefined ? `, ${turn.turns.toLocaleString("en-US")} turns` : ""}): ${blendNote(turn.mix)}`,
 					"Comparison percentages weight each endpoint's rates over this turn.",
@@ -1049,7 +1269,7 @@ export default function (pi: ExtensionAPI) {
 					);
 					return;
 				}
-				setFallbackRouting(agentDir, routing);
+				reportPersist(ctx, setFallbackRouting(agentDir, routing));
 				ctx.ui.notify(`Flex fallback routing: ${describeFallbackRouting(routing)}`, "info");
 				return;
 			}
@@ -1120,7 +1340,7 @@ export default function (pi: ExtensionAPI) {
 				refresh: args === "refresh",
 			});
 			const flex = flexEndpoints(endpoints);
-			const turn = resolveTurnMix(agentDir);
+			const turn = await resolveTurnMix(agentDir);
 			const reference = referencePrice(endpoints, catalogCost(model), turn.mix);
 			const about = resolvedFrom ? ` (resolved from \`${resolvedFrom}\`)` : "";
 
@@ -1152,27 +1372,8 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const { pin } = resolvePin(agentDir, model);
-
 			if (args === "on") {
-				// Auto routing must be able to honor the pin; otherwise the pin would be moot.
-				if (pin) {
-					const capable = flexProviderSlugs(endpoints);
-					const missing =
-						pin.mode === "only"
-							? pin.providers.filter((provider) => !capable.has(provider))
-							: pin.providers.some((provider) => capable.has(provider))
-								? []
-								: pin.providers;
-					if (missing.length > 0) {
-						const available = [...capable].join(", ") || "none";
-						ctx.ui.notify(
-							`Flex would ignore the pin: no flex endpoint for ${missing.join(", ")} on ${slug}.\nFlex-capable providers: ${available}.\nRun /pin off, retarget the pin, or /flex <endpoint> to read the pin state.`,
-							"warning",
-						);
-						return;
-					}
-				}
+				// `applyFlex` refuses flex auto when the pin could not be honored.
 				applyFlex(ctx, model, { endpoint: null, updatedAt: Date.now() }, endpoints);
 				return;
 			}
@@ -1232,7 +1433,7 @@ export default function (pi: ExtensionAPI) {
 			// A persisted pin supersedes any session override for this model.
 			deleteSessionPin(key);
 			persistSessionPins();
-			setPinBinding(agentDir, key, binding);
+			reportPersist(ctx, setPinBinding(agentDir, key, binding));
 		}
 		// The pin changes which flex endpoint auto routing would use and which standard
 		// endpoints are comparable, so the advisory is recomputed.
@@ -1311,7 +1512,7 @@ export default function (pi: ExtensionAPI) {
 					);
 					return;
 				}
-				setPinBinding(agentDir, key, null);
+				reportPersist(ctx, setPinBinding(agentDir, key, null));
 				deleteSessionPin(key);
 				persistSessionPins();
 				ensureAdvice(ctx, model);
@@ -1458,6 +1659,29 @@ function flexCapabilityWarning(
 		return `Flex is on but none of ${providers.join(", ")} has a flex endpoint for ${slug}.\nFlex-capable: ${[...capable].join(", ")}. Run /flex off first, or pick a flex-capable provider.`;
 	}
 	return undefined;
+}
+
+/**
+ * Why flex auto cannot honor this pin, or `undefined` when it can. Auto sends the flex
+ * tier with the pin's provider list, so providers without a flex endpoint would never
+ * serve: `only` needs every pinned provider to be flex-capable, `prefer` at least one.
+ * When no flex endpoint is known at all there is nothing to judge.
+ */
+function pinBlocksFlex(
+	pin: PinBinding,
+	endpoints: readonly Endpoint[],
+	slug: string,
+): string | undefined {
+	const capable = flexProviderSlugs(endpoints);
+	if (capable.size === 0) return undefined;
+	const missing =
+		pin.mode === "only"
+			? pin.providers.filter((provider) => !capable.has(provider))
+			: pin.providers.some((provider) => capable.has(provider))
+				? []
+				: pin.providers;
+	if (missing.length === 0) return undefined;
+	return `Flex auto would break the pin: no flex endpoint for ${missing.join(", ")} on ${slug}.\nFlex-capable providers: ${[...capable].join(", ")}.\nRetarget the pin with /pin, remove it with /pin off, or pin a flex endpoint with /flex <endpoint>.`;
 }
 
 /** Run `fn` over `items` with at most `limit` calls in flight. */
