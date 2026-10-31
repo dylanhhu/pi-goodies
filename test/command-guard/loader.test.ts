@@ -25,4 +25,5 @@ test("pi's real extension loader loads the directory extension and registers its
 	for (const event of ["tool_call", "message_end", "agent_end", "session_start"]) {
 		assert.ok(ext.handlers.has(event), event);
 	}
+	assert.ok(ext.commands.has("permissions"), "/permissions is registered");
 });

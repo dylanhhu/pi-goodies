@@ -9,6 +9,9 @@
  *      flag with action "judge", and optionally every unmatched bash call
  *   4. The human, via a confirm dialog, whenever the outcome is "confirm"
  *
+ * The human can switch the whole guard off for a session with `/permissions yolo`
+ * (see modes.ts); `/permissions default` turns it back on.
+ *
  * Config files (both optional, merged; the project file can only tighten):
  *   ~/.pi/agent/command-guard.json   global
  *   .pi/command-guard.json           project-local
@@ -30,9 +33,18 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { buildPolicy, loadConfigFile } from "./config.ts";
+import { buildPolicy, loadConfigFile, type Policy } from "./config.ts";
 import { createGuard } from "./guard.ts";
 import { type ClassifyFn, createJudge } from "./judge.ts";
+import {
+	DEFAULT_MODE,
+	enforcedPolicy,
+	getMode,
+	MODE_ENTRY_TYPE,
+	PERMISSION_MODES,
+	type PermissionMode,
+	restoreMode,
+} from "./modes.ts";
 import { createTurnBuffer } from "./turn-buffer.ts";
 import { type GuardRule, TOOL_NAMES } from "./types.ts";
 
@@ -42,6 +54,8 @@ import { type GuardRule, TOOL_NAMES } from "./types.ts";
  * user authorized.
  */
 const DELEGATED_ENV = "PI_GOODIES_SUBAGENT";
+
+const STATUS_KEY = "command-guard";
 
 function escapeRegExp(text: string): string {
 	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -75,11 +89,21 @@ export default function (pi: ExtensionAPI) {
 	/** The context of the latest tool call; the decision model is reached through it */
 	let latestCtx: ExtensionContext | undefined;
 
-	// Policies are built per working directory and cached until /reload
+	/** The permission mode of this session. Set by /permissions; never by config or the model */
+	let mode: PermissionMode = DEFAULT_MODE;
+
+	interface Base {
+		policy: Policy;
+		judge?: ReturnType<typeof createJudge>;
+	}
+
+	// Policies are built per working directory and cached until /reload; guards
+	// are cached per mode as well, since a mode may change the enforced policy
+	const bases = new Map<string, Base>();
 	const guards = new Map<string, ReturnType<typeof createGuard>>();
 
-	function guardFor(cwd: string, ctx: ExtensionContext) {
-		const cached = guards.get(cwd);
+	function baseFor(cwd: string, ctx: ExtensionContext): Base {
+		const cached = bases.get(cwd);
 		if (cached) return cached;
 
 		const warnings: string[] = [];
@@ -114,20 +138,84 @@ export default function (pi: ExtensionAPI) {
 			else console.error(`[command-guard] ${warning}`);
 		}
 
+		const base = { policy, judge };
+		bases.set(cwd, base);
+		return base;
+	}
+
+	function guardFor(cwd: string, ctx: ExtensionContext) {
+		const key = `${mode.name}\0${cwd}`;
+		const cached = guards.get(key);
+		if (cached) return cached;
+
+		const { policy, judge } = baseFor(cwd, ctx);
 		const guard = createGuard({
-			policy,
+			policy: enforcedPolicy(mode, policy),
 			home,
 			turnBuffer,
 			delegated,
 			judge,
 			audit: (entry) => pi.appendEntry("command-guard", entry),
 		});
-		guards.set(cwd, guard);
+		guards.set(key, guard);
 		return guard;
 	}
 
-	pi.on("session_start", () => {
+	function syncStatus(ctx: ExtensionContext) {
+		if (!ctx.hasUI) return;
+		ctx.ui.setStatus(STATUS_KEY, mode.badge ? ctx.ui.theme.fg("warning", mode.badge) : undefined);
+	}
+
+	pi.registerCommand("permissions", {
+		description: `Show or set the command-guard permission mode (${PERMISSION_MODES.map((m) => m.name).join(", ")})`,
+		getArgumentCompletions: (prefix) => {
+			const matches = PERMISSION_MODES.filter((m) =>
+				m.name.startsWith(prefix.trim().toLowerCase()),
+			);
+			return matches.length > 0
+				? matches.map((m) => ({ value: m.name, label: m.name, description: m.description }))
+				: null;
+		},
+		handler: async (args, ctx) => {
+			const requested = args.trim().toLowerCase();
+			if (!requested) {
+				const lines = PERMISSION_MODES.map(
+					(m) => `${m === mode ? "*" : " "} ${m.name}: ${m.description}`,
+				);
+				ctx.ui.notify(`Permission mode: ${mode.name}\n${lines.join("\n")}`, "info");
+				return;
+			}
+			const next = getMode(requested);
+			if (!next) {
+				const names = PERMISSION_MODES.map((m) => m.name).join(", ");
+				ctx.ui.notify(`Unknown permission mode "${requested}". Modes: ${names}`, "error");
+				return;
+			}
+			if (next === mode) {
+				ctx.ui.notify(`Permission mode is already ${mode.name}`, "info");
+				return;
+			}
+			mode = next;
+			pi.appendEntry(MODE_ENTRY_TYPE, { mode: mode.name });
+			syncStatus(ctx);
+			ctx.ui.notify(
+				mode.warning ?? `Permission mode: ${mode.name}`,
+				mode.warning ? "warning" : "info",
+			);
+		},
+	});
+
+	pi.on("session_start", (event, ctx) => {
 		turnBuffer.reset();
+		// Only a reload keeps the mode, since it re-runs this module in the same session.
+		// A resumed or forked session file is not trusted to switch the guard off, and
+		// without a UI nobody would see that it is off
+		mode =
+			event.reason === "reload" && ctx.hasUI
+				? restoreMode(ctx.sessionManager.getBranch())
+				: DEFAULT_MODE;
+		syncStatus(ctx);
+		if (mode.warning) ctx.ui.notify(`Permission mode restored: ${mode.warning}`, "warning");
 	});
 
 	pi.on("message_end", (event) => {
@@ -141,6 +229,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_call", async (event, ctx) => {
 		// Tools the guard does not cover must not depend on (or be broken by) the policy
 		if (!(TOOL_NAMES as readonly string[]).includes(event.toolName)) return undefined;
+		// The human switched the guard off: no part of it may run, so nothing in it can block
+		if (mode.bypass) return undefined;
 		latestCtx = ctx;
 
 		let guard: ReturnType<typeof createGuard>;

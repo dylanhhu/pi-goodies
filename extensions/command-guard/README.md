@@ -135,6 +135,24 @@ This applies ahead of the allowlist, and rules stricter than the oversize outcom
 
 A command takes the fast path only if it is plain words: no quotes, expansion, redirection, globbing, or composition (`; & | < > $ \` ( ) { } * ? [ \\`and so on all disqualify it). The first word must be a bare allowlisted command, flags are checked against per-command deny lists (abbreviations and bundles included), and path arguments must not be sensitive, nor, for recursive readers such as`grep`and`rg`, be an ancestor of a sensitive location. Paths are judged as written and where they really point, so a symlink in the project cannot stand in for a secret, and flags that follow symlinks (`grep -R`, `rg -L`) are refused. The allowlist only skips the decision model: it never overrides a rule match.
 
+## Permission modes
+
+`/permissions [mode]` switches how the guard is enforced for the current session; with no argument it lists the modes and marks the active one. Only the human can run it, so the model cannot change the mode.
+
+| Mode      | Effect                                                                                    |
+| --------- | ----------------------------------------------------------------------------------------- |
+| `default` | The configured rules, allowlist, and decision model                                       |
+| `yolo`    | The guard does not run: nothing is blocked, judged, or confirmed, and nothing is recorded |
+
+What yolo implies:
+
+- `block` rules, the oversize outcome, and the protection of command-guard's own source and config are all bypassed. The model can therefore edit `extensions/command-guard/` or `~/.pi/agent/command-guard.json`, which loosens the guard beyond the session after the next `/reload` or new session
+- The footer shows `YOLO` while it is on
+- The mode is per session, never read from config or the environment. Each switch is saved as a `command-guard-mode` session entry, and only `/reload` restores it (with a notice, and only with a UI). Starting, resuming, or forking a session begins in `default`, so a session file cannot switch the guard off
+- Subagents always run `default`. They have no UI, so their confirm outcomes are blocks even while the parent is in yolo
+
+A mode is an entry in `PERMISSION_MODES` (`modes.ts`) with either `bypass: true`, or `apply`, a function from the configured policy to the policy to enforce (for example one that tightens `unmatched`). Modes that need their own refusal wording or that cover tools beyond `bash`, `write`, and `edit` would need a further seam in the pipeline.
+
 ## Limits
 
 - Layer 1 is text matching. Obfuscated, computed, or interpreter-embedded actions are the decision model's job, and without one they are not caught
