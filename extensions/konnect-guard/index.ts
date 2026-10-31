@@ -4,8 +4,9 @@
  * Konnect ships Claude Code `PreToolUse` hooks (see `konnect hook <name>` and the
  * matcher table in `~/.claude/settings.json`) that restate its board-state rules
  * before PCB tools run. Pi has no hook configuration, so the same rules are added
- * as a system-prompt section whenever the `konnect` MCP server's tools are
- * registered. The section stays out of sessions that never load Konnect.
+ * as a system-prompt section once a Konnect tool is declared to the model. The
+ * server uses deferred exposure, so a session that never searches for a Konnect
+ * tool never carries the section; one that does gets it on the next run.
  *
  * The per-tool requirements still come from the server's own tool descriptions and
  * server-side guards; this text only keeps the model from working around them.
@@ -31,7 +32,9 @@ export function hasKonnectTools(toolNames: readonly string[]): boolean {
 export default function konnectGuard(pi: ExtensionAPI): void {
 	pi.on("before_agent_start", (event) => {
 		if (event.systemPromptOptions.sections[GUARDRAIL_SECTION]) return;
-		if (!hasKonnectTools(pi.getAllTools().map((tool) => tool.name))) return;
+		// Gate on declared tools, not registered ones: Konnect uses deferred exposure,
+		// so this keeps the guardrails out of sessions that never load a Konnect tool.
+		if (!hasKonnectTools(pi.getActiveTools())) return;
 		event.systemPromptOptions.sections[GUARDRAIL_SECTION] = GUARDRAILS;
 	});
 }

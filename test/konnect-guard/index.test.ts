@@ -12,14 +12,22 @@ type BeforeAgentStartHandler = (event: {
 	systemPromptOptions: { sections: Record<string, string> };
 }) => void;
 
-/** Run the extension's before_agent_start handler against a fake pi. */
-function startRun(toolNames: string[], sections: Record<string, string> = {}) {
+/**
+ * Run the extension's before_agent_start handler against a fake pi.
+ * `active` is what `getActiveTools()` reports, `registered` what `getAllTools()` reports.
+ */
+function startRun(
+	active: string[],
+	sections: Record<string, string> = {},
+	registered: string[] = active,
+) {
 	let handler: BeforeAgentStartHandler | undefined;
 	const pi = {
 		on: (name: string, fn: BeforeAgentStartHandler) => {
 			if (name === "before_agent_start") handler = fn;
 		},
-		getAllTools: () => toolNames.map((name) => ({ name })),
+		getActiveTools: () => [...active],
+		getAllTools: () => registered.map((name) => ({ name })),
 	};
 	konnectGuard(pi as unknown as ExtensionAPI);
 	assert.ok(handler, "extension registers a before_agent_start handler");
@@ -45,9 +53,18 @@ describe("konnect-guard: session gating", () => {
 });
 
 describe("konnect-guard: prompt section", () => {
-	test("adds the guardrails when Konnect tools are registered", () => {
+	test("adds the guardrails once a Konnect tool is declared", () => {
 		const sections = startRun(["read", `${KONNECT_TOOL_PREFIX}load_toolset`]);
 		assert.equal(sections[GUARDRAIL_SECTION], GUARDRAILS);
+	});
+
+	test("ignores Konnect tools that are registered but still deferred", () => {
+		const sections = startRun(["read", "tool_search"], {}, [
+			"read",
+			"tool_search",
+			`${KONNECT_TOOL_PREFIX}load_toolset`,
+		]);
+		assert.deepEqual(sections, {});
 	});
 
 	test("leaves sessions without Konnect tools untouched", () => {
