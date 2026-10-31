@@ -186,6 +186,14 @@ export function buildAuthContext(input: JudgeInput): ClassifyContext | undefined
 
 const FALLBACK: Thresholds = { confirm: 0.3, block: 0.9 };
 
+/** The thresholds that apply to one dimension. */
+export function thresholdFor(
+	dimension: string,
+	thresholds: Record<string, Thresholds>,
+): Thresholds {
+	return thresholds[dimension] ?? thresholds.default ?? FALLBACK;
+}
+
 export function interpret(
 	scores: Record<string, number>,
 	thresholds: Record<string, Thresholds>,
@@ -193,7 +201,7 @@ export function interpret(
 	let outcome: JudgeVerdict["outcome"] = "allow";
 	const flagged: string[] = [];
 	for (const [dimension, p] of Object.entries(scores)) {
-		const t = thresholds[dimension] ?? thresholds.default ?? FALLBACK;
+		const t = thresholdFor(dimension, thresholds);
 		if (p >= t.block) outcome = "block";
 		else if (p >= t.confirm && outcome !== "block") outcome = "confirm";
 		if (p >= t.confirm) flagged.push(`${dimension} ${p.toFixed(2)}`);

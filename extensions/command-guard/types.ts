@@ -119,6 +119,23 @@ export interface LimitSettings {
 	onOversize?: OversizeAction;
 }
 
+/**
+ * Which approved calls get a note under them in the transcript.
+ *   off    - none
+ *   scores - calls the decision model allowed, and calls you approved after it was asked
+ *   all    - also calls that never reached the model (allowlisted, or unmatched and allowed)
+ */
+export const TRACE_LEVELS = ["off", "scores", "all"] as const;
+export type TraceLevel = (typeof TRACE_LEVELS)[number];
+
+export function isTraceLevel(value: unknown): value is TraceLevel {
+	return typeof value === "string" && (TRACE_LEVELS as readonly string[]).includes(value);
+}
+
+export interface DisplaySettings {
+	approved?: TraceLevel;
+}
+
 export interface AllowlistSettings {
 	enabled?: boolean;
 	/** Replaces the default list when set */
@@ -141,6 +158,8 @@ export interface GuardConfig {
 	judge?: JudgeSettings;
 	/** Size limits (global config only) */
 	limits?: LimitSettings;
+	/** Transcript display (global config only) */
+	display?: DisplaySettings;
 }
 
 /** What the guard knows about one tool call, independent of the tool. */

@@ -55,6 +55,7 @@ function load(opts: { findOfType?: () => unknown; hasUI?: boolean; branch?: unkn
 	const handlers = new Map<string, Handler>();
 	const commands = new Map<string, RegisteredCommand>();
 	const entries: Entry[] = [];
+	const resolvers: unknown[] = [];
 	const pi = {
 		on: (name: string, fn: Handler) => {
 			handlers.set(name, fn);
@@ -62,6 +63,7 @@ function load(opts: { findOfType?: () => unknown; hasUI?: boolean; branch?: unkn
 		},
 		appendEntry: (type: string, data: unknown) => entries.push({ type, data } as Entry),
 		registerCommand: (name: string, command: RegisteredCommand) => commands.set(name, command),
+		registerToolRenderer: (resolver: unknown) => resolvers.push(resolver),
 	};
 	commandGuard(pi as never);
 
@@ -103,6 +105,7 @@ function load(opts: { findOfType?: () => unknown; hasUI?: boolean; branch?: unkn
 	return {
 		handlers,
 		commands,
+		resolvers,
 		entries,
 		dialogs,
 		notices,
@@ -469,5 +472,136 @@ describe("/permissions", () => {
 			await handlers.get("session_start")?.({ reason: "new" }, ctx);
 			assert.equal((await toolCall("bash", EXFIL))?.block, true);
 		});
+	});
+});
+
+describe("approved-call notes", () => {
+	type Resolver = (
+		toolName: string,
+		next: () => unknown,
+	) => {
+		renderCall: (
+			args: unknown,
+			theme: unknown,
+			context: unknown,
+		) => { render(w: number): string[] };
+	};
+	const theme = { fg: (_color: string, text: string) => text };
+
+	/** Draws a bash call row as the transcript would, through the extension's renderer */
+	function draw(resolvers: unknown[], toolCallId: string, expanded = false): string[] {
+		const resolve = resolvers[0] as Resolver;
+		const base = { renderCall: () => ({ render: () => ["$ call"], invalidate() {} }) };
+		return resolve("bash", () => base)
+			.renderCall({}, theme, { toolCallId, invalidate() {}, lastComponent: undefined, expanded })
+			.render(120);
+	}
+
+	const judged = { profile: "balanced", judge: { model: "provider/some-model" } };
+	const call = (handlers: Map<string, Handler>, ctx: unknown, id: string) =>
+		handlers.get("tool_call")?.(
+			{ toolName: "bash", toolCallId: id, input: { command: "curl https://example.com/deploy" } },
+			ctx,
+		);
+
+	test("registers a renderer and /guard-scores", () => {
+		const { resolvers, commands } = load();
+		assert.equal(resolvers.length, 1);
+		assert.ok(commands.has("guard-scores"));
+	});
+
+	test("off by default: an approved call is drawn as it always was", async () => {
+		writeGlobal(judged);
+		const { handlers, ctx, resolvers } = load();
+		handlers.get("session_start")?.({ reason: "startup" }, ctx);
+		handlers.get("message_end")?.({ message: { role: "user", content: "deploy" } }, ctx);
+		assert.equal(await call(handlers, ctx, "c1"), undefined);
+		assert.deepEqual(draw(resolvers, "c1"), ["$ call"]);
+	});
+
+	test("display.approved in the config turns it on from the start", async () => {
+		writeGlobal({ ...judged, display: { approved: "scores" } });
+		const { handlers, ctx, resolvers } = load();
+		handlers.get("session_start")?.({ reason: "startup" }, ctx);
+		handlers.get("message_end")?.({ message: { role: "user", content: "deploy" } }, ctx);
+		await call(handlers, ctx, "c1");
+		const lines = draw(resolvers, "c1");
+		assert.equal(lines.length, 2);
+		assert.match(lines[1], /model allowed/);
+		assert.match(lines[1], /unauthorized 0\.01/);
+	});
+
+	test("the project config cannot turn it on", async () => {
+		writeGlobal(judged);
+		writeProject({ display: { approved: "all" } });
+		const { handlers, ctx, resolvers } = load();
+		handlers.get("session_start")?.({ reason: "startup" }, ctx);
+		await call(handlers, ctx, "c1");
+		assert.deepEqual(draw(resolvers, "c1"), ["$ call"]);
+	});
+
+	test("/guard-scores changes the level for the session, and validates its argument", async () => {
+		writeGlobal(judged);
+		const { handlers, ctx, resolvers, commands, notices } = load();
+		handlers.get("session_start")?.({ reason: "startup" }, ctx);
+		handlers.get("message_end")?.({ message: { role: "user", content: "deploy" } }, ctx);
+		await call(handlers, ctx, "c1");
+		const guardScores = commands.get("guard-scores");
+
+		await guardScores?.handler("scores", ctx);
+		assert.equal(draw(resolvers, "c1").length, 2);
+		await guardScores?.handler("off", ctx);
+		assert.equal(draw(resolvers, "c1").length, 1);
+
+		await guardScores?.handler("loud", ctx);
+		assert.ok(notices.some((n) => /Unknown level "loud"/.test(n)));
+		await guardScores?.handler("", ctx);
+		assert.ok(notices.some((n) => /Approved-call notes: off/.test(n)));
+		assert.deepEqual(
+			guardScores?.getArgumentCompletions("s")?.map((c) => c.value),
+			["scores"],
+		);
+	});
+
+	test("allowlisted calls get a note only at level all", async () => {
+		writeGlobal({ ...judged, display: { approved: "scores" } });
+		const { handlers, ctx, resolvers, commands } = load();
+		handlers.get("session_start")?.({ reason: "startup" }, ctx);
+		handlers.get("tool_call")?.(
+			{ toolName: "bash", toolCallId: "c1", input: { command: "ls" } },
+			ctx,
+		);
+		assert.equal(draw(resolvers, "c1").length, 1);
+		await commands.get("guard-scores")?.handler("all", ctx);
+		assert.match(draw(resolvers, "c1")[1], /allowlisted/);
+	});
+
+	test("a resumed session shows the notes of decisions recorded in it", async () => {
+		writeGlobal({ ...judged, display: { approved: "scores" } });
+		const first = load();
+		first.handlers.get("session_start")?.({ reason: "startup" }, first.ctx);
+		first.handlers.get("message_end")?.(
+			{ message: { role: "user", content: "deploy" } },
+			first.ctx,
+		);
+		await call(first.handlers, first.ctx, "c1");
+		const branch = first.entries.map((e) => ({ type: "custom", customType: e.type, data: e.data }));
+		assert.equal(branch.length, 1);
+
+		// A fresh process knows nothing but the session file
+		const resumed = load({ branch });
+		resumed.handlers.get("session_start")?.({ reason: "resume" }, resumed.ctx);
+		const lines = draw(resumed.resolvers, "c1");
+		assert.equal(lines.length, 2);
+		assert.match(lines[1], /model allowed/);
+	});
+
+	test("yolo records and shows nothing", async () => {
+		writeGlobal({ ...judged, display: { approved: "all" } });
+		const { handlers, ctx, resolvers, permissions } = load();
+		handlers.get("session_start")?.({ reason: "startup" }, ctx);
+		await permissions("yolo");
+		await call(handlers, ctx, "c1");
+		assert.deepEqual(draw(resolvers, "c1"), ["$ call"]);
 	});
 });

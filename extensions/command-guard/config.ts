@@ -15,11 +15,13 @@ import { DEFAULT_ALLOWED_HOSTS, DEFAULT_RULES } from "./default-rules.ts";
 import {
 	type Action,
 	type Category,
+	type DisplaySettings,
 	type GuardConfig,
 	type GuardRule,
 	type HostMatcher,
 	isAction,
 	isCategory,
+	isTraceLevel,
 	type JudgeSettings,
 	type LimitSettings,
 	maxAction,
@@ -28,6 +30,7 @@ import {
 	type Profile,
 	TOOL_NAMES,
 	type ToolName,
+	type TraceLevel,
 } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -126,6 +129,7 @@ export interface Policy {
 	allowlist: { enabled: boolean; entries: AllowEntry[] };
 	judge?: ResolvedJudge;
 	limits: ResolvedLimits;
+	display: { approved: TraceLevel };
 	warnings: string[];
 }
 
@@ -355,6 +359,19 @@ function parseAllowlist(raw: unknown, warnings: string[]): GuardConfig["allowlis
 	return allowlist;
 }
 
+function parseDisplay(raw: unknown, warnings: string[]): DisplaySettings | undefined {
+	if (!isRecord(raw)) {
+		warnings.push("display must be an object");
+		return undefined;
+	}
+	const display: DisplaySettings = {};
+	if (raw.approved !== undefined) {
+		if (isTraceLevel(raw.approved)) display.approved = raw.approved;
+		else warnings.push('display.approved must be "off", "scores", or "all"; using "off"');
+	}
+	return display;
+}
+
 function parseLimits(raw: unknown, warnings: string[]): LimitSettings | undefined {
 	if (!isRecord(raw)) {
 		warnings.push("limits must be an object");
@@ -435,6 +452,7 @@ export function parseConfig(raw: unknown, warnings: string[]): GuardConfig {
 	if (raw.allowlist !== undefined) cfg.allowlist = parseAllowlist(raw.allowlist, warnings);
 	if (raw.judge !== undefined) cfg.judge = parseJudge(raw.judge, warnings);
 	if (raw.limits !== undefined) cfg.limits = parseLimits(raw.limits, warnings);
+	if (raw.display !== undefined) cfg.display = parseDisplay(raw.display, warnings);
 	return cfg;
 }
 
@@ -632,6 +650,7 @@ export function buildPolicy(layers: PolicyLayers, opts: BuildOptions = {}): Poli
 		},
 		judge: resolveJudge(global.judge),
 		limits: resolveLimits(global.limits),
+		display: { approved: global.display?.approved ?? "off" },
 		warnings,
 	};
 }

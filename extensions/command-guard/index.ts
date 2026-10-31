@@ -45,8 +45,9 @@ import {
 	type PermissionMode,
 	restoreMode,
 } from "./modes.ts";
+import { AUDIT_ENTRY_TYPE, createTrace } from "./trace.ts";
 import { createTurnBuffer } from "./turn-buffer.ts";
-import { type GuardRule, TOOL_NAMES } from "./types.ts";
+import { type GuardRule, isTraceLevel, TOOL_NAMES, TRACE_LEVELS } from "./types.ts";
 
 /**
  * Set to "1" by the subagent extension in the pi processes it starts. Their only
@@ -84,6 +85,7 @@ export default function (pi: ExtensionAPI) {
 	const globalPath = join(home, ".pi", "agent", "command-guard.json");
 	const selfProtection = selfProtectionRule();
 	const turnBuffer = createTurnBuffer();
+	const trace = createTrace();
 	const delegated = process.env[DELEGATED_ENV] === "1";
 
 	/** The context of the latest tool call; the decision model is reached through it */
@@ -155,7 +157,8 @@ export default function (pi: ExtensionAPI) {
 			turnBuffer,
 			delegated,
 			judge,
-			audit: (entry) => pi.appendEntry("command-guard", entry),
+			audit: (entry) => pi.appendEntry(AUDIT_ENTRY_TYPE, entry),
+			trace: (entry) => trace.record(entry),
 		});
 		guards.set(key, guard);
 		return guard;
@@ -205,8 +208,49 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerToolRenderer(trace.resolver);
+
+	const TRACE_DESCRIPTIONS: Record<(typeof TRACE_LEVELS)[number], string> = {
+		off: "No note under approved calls",
+		scores: "Note under calls the decision model allowed or you approved after it flagged them",
+		all: "Also a note under calls that never reached the decision model",
+	};
+
+	pi.registerCommand("guard-scores", {
+		description: `Show how approved calls were decided, under each call (${TRACE_LEVELS.join(", ")})`,
+		getArgumentCompletions: (prefix) => {
+			const matches = TRACE_LEVELS.filter((level) => level.startsWith(prefix.trim().toLowerCase()));
+			return matches.length > 0
+				? matches.map((level) => ({
+						value: level,
+						label: level,
+						description: TRACE_DESCRIPTIONS[level],
+					}))
+				: null;
+		},
+		handler: async (args, ctx) => {
+			const requested = args.trim().toLowerCase();
+			if (!requested) {
+				const lines = TRACE_LEVELS.map(
+					(level) => `${level === trace.level ? "*" : " "} ${level}: ${TRACE_DESCRIPTIONS[level]}`,
+				);
+				ctx.ui.notify(`Approved-call notes: ${trace.level}\n${lines.join("\n")}`, "info");
+				return;
+			}
+			if (!isTraceLevel(requested)) {
+				ctx.ui.notify(`Unknown level "${requested}". Levels: ${TRACE_LEVELS.join(", ")}`, "error");
+				return;
+			}
+			trace.setLevel(requested);
+			ctx.ui.notify(`Approved-call notes: ${requested}`, "info");
+		},
+	});
+
 	pi.on("session_start", (event, ctx) => {
 		turnBuffer.reset();
+		// The starting level is the configured one; /guard-scores changes it for this session
+		trace.setLevel(loadConfigFile(globalPath, [])?.display?.approved ?? "off");
+		trace.load(ctx.sessionManager.getBranch());
 		// Only a reload keeps the mode, since it re-runs this module in the same session.
 		// A resumed or forked session file is not trusted to switch the guard off, and
 		// without a UI nobody would see that it is off

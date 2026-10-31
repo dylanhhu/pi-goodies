@@ -477,8 +477,9 @@ describe("config shape validation", () => {
 			judge: [],
 			allowlist: 5,
 			limits: "x",
+			display: [],
 		});
-		assert.equal(warnings.length, 5);
+		assert.equal(warnings.length, 6);
 	});
 
 	test("no config shape makes buildPolicy throw", () => {
@@ -488,6 +489,7 @@ describe("config shape validation", () => {
 			{ judge: { model: 5, thresholds: [] } },
 			{ allowlist: { commands: [null, 5, { cmd: 5 }] } },
 			{ limits: { maxActionChars: "lots", onOversize: 7 } },
+			{ display: { approved: 7 } },
 			{ defaults: [], unmatched: 5, overrides: "x" },
 			[],
 			null,
@@ -530,5 +532,39 @@ describe("limits", () => {
 			maxActionChars: DEFAULT_MAX_ACTION_CHARS,
 			onOversize: "confirm",
 		});
+	});
+});
+
+describe("display", () => {
+	const level = (layers: Parameters<typeof buildPolicy>[0]) =>
+		buildPolicy(layers, { rules: [] }).display.approved;
+
+	test("approved-call notes are off by default", () => {
+		assert.equal(level({}), "off");
+	});
+
+	test("accepts each level", () => {
+		for (const approved of ["off", "scores", "all"]) {
+			const warnings: string[] = [];
+			const cfg = parseConfig({ display: { approved } }, warnings);
+			assert.deepEqual(warnings, []);
+			assert.equal(level({ global: cfg }), approved);
+		}
+	});
+
+	test("comes from the global config only", () => {
+		const cfg = parseConfig({ display: { approved: "all" } }, []);
+		assert.equal(level({ project: cfg }), "off");
+		assert.equal(
+			level({ global: parseConfig({ display: { approved: "scores" } }, []), project: cfg }),
+			"scores",
+		);
+	});
+
+	test("an unknown level is reported and replaced by off", () => {
+		const warnings: string[] = [];
+		const cfg = parseConfig({ display: { approved: "verbose" } }, warnings);
+		assert.equal(warnings.length, 1);
+		assert.equal(level({ global: cfg }), "off");
 	});
 });
