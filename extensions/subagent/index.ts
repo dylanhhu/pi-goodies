@@ -372,6 +372,8 @@ async function runSingleAgent(
 				cwd: cwd ?? defaultCwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
+				// Tells command-guard that the task prompt was written by a model, not the user
+				env: { ...process.env, PI_GOODIES_SUBAGENT: "1" },
 			});
 			let buffer = "";
 
