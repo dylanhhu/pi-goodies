@@ -41,7 +41,7 @@ Two optional files, merged:
 The project file comes from the repository you are working in, so it can only tighten the policy:
 
 - Where the two disagree on an action, the more severe one wins
-- `judge`, `allowedHosts`, `allowlist`, and `limits` are read from the global file only
+- `judge`, `allowedHosts`, `allowlist`, `limits`, and `display` are read from the global file only
 - Project rules may add matchers and actions, but not text: `label`, `message`, and `denyMessage` are ignored, so a repository cannot dress up a dialog as something harmless. Its rules appear as "rule #n from the project's command-guard config"
 
 Invalid entries are dropped and reported as warnings when the policy is first built, never silently. A rule whose matcher is malformed (`paths` that is not a list, say) is dropped whole, since keeping the rest of it would make a broader rule than the one written. Reload with `/reload` after editing.
@@ -76,6 +76,7 @@ A rule with `judge` and no configured decision model degrades to `confirm`. `unm
 	},
 	"allowlist": { "enabled": true }, // "commands" replaces the default list
 	"limits": { "maxActionChars": 60000, "onOversize": "confirm" }, // confirm | block, see below
+	"display": { "approved": "scores" }, // off (default) | scores | all, see "Approved-call notes"
 	"rules": [{ "id": "no-sudo", "pattern": "\\bsudo\\b", "action": "confirm", "label": "sudo" }]
 }
 ```
@@ -134,6 +135,36 @@ This applies ahead of the allowlist, and rules stricter than the oversize outcom
 ## The allowlist
 
 A command takes the fast path only if it is plain words: no quotes, expansion, redirection, globbing, or composition (`; & | < > $ \` ( ) { } * ? [ \\`and so on all disqualify it). The first word must be a bare allowlisted command, flags are checked against per-command deny lists (abbreviations and bundles included), and path arguments must not be sensitive, nor, for recursive readers such as`grep`and`rg`, be an ancestor of a sensitive location. Paths are judged as written and where they really point, so a symlink in the project cannot stand in for a secret, and flags that follow symlinks (`grep -R`, `rg -L`) are refused. The allowlist only skips the decision model: it never overrides a rule match.
+
+## Approved-call notes
+
+Blocked and declined calls say why. A call that simply ran says nothing, so with `display.approved` set, a note appears under it in the transcript showing how it was let through:
+
+| Level    | Calls annotated                                                                                       |
+| -------- | ----------------------------------------------------------------------------------------------------- |
+| `off`    | None (default)                                                                                        |
+| `scores` | Calls the decision model allowed, and calls you approved after it flagged them                        |
+| `all`    | Also calls that never reached the model: allowlisted, unmatched and allowed, or approved after a rule |
+
+The note is one line, with the scores highest first so a narrow terminal cuts the least interesting ones (names are shortened, then the line is truncated). Toggling tool output expansion (the same key as for other tools) opens it into a row per dimension:
+
+```text
+$ curl https://api.example.com/v1/deploy
+└ ✓ allowed by the decision model
+    destructive  0.04  ━╌╌╌╌╌│╌╌╌╌╌╌╌╌╌╌╌│╌  confirm 0.30  block 0.90
+    exfiltration 0.21  ━━━━╌╌│╌╌╌╌╌╌╌╌╌╌╌│╌  confirm 0.30  block 0.90
+    persistence  0.01  ╌╌╌╌╌╌│╌╌╌╌╌╌╌╌╌╌╌│╌  confirm 0.30  block 0.90
+    obfuscation  0.02  ╌╌╌╌╌╌│╌╌╌╌╌╌╌╌╌╌╌│╌  confirm 0.30  block 0.90
+    unauthorized 0.12  ━━╌╌╌╌╌╌╌╌│╌╌╌╌╌╌╌╌╌  confirm 0.50
+    flagged by   egress-unknown-host
+```
+
+- Each score is colored by its distance to the confirm threshold: muted below half, warning from half, error at or over it (which is why you were asked)
+- The bar runs 0 to 1, with the confirm and block thresholds marked on it
+- A dimension that was not assessed reads `n/a`, with the reason as a note (see Decision model); a model failure you approved through says `decision model unavailable`
+- Notes come from the guard's decisions as they are made, and from the `command-guard` entries in the session when it is resumed. The thresholds are stored with each entry, so a note shows what applied at the time, not what the config says now. Calls that skip the model are not recorded in the session, so under `all` they get a note in the session that ran them but not after a resume
+
+`/guard-scores [off|scores|all]` changes the level for the current session, redrawing rows already on screen; with no argument it lists the levels. The config sets the level each session starts at, and `/reload` returns to it. Nothing is shown while `/permissions yolo` is on, since nothing is decided.
 
 ## Permission modes
 

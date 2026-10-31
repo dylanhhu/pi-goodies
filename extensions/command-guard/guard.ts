@@ -7,7 +7,7 @@
 import type { Policy } from "./config.ts";
 import { type Decision, decide } from "./decide.ts";
 import { describeToolCall } from "./descriptor.ts";
-import type { JudgeInput, JudgeVerdict } from "./judge.ts";
+import { type JudgeInput, type JudgeVerdict, thresholdFor } from "./judge.ts";
 import type { TurnBuffer } from "./turn-buffer.ts";
 import type { Descriptor } from "./types.ts";
 
@@ -19,6 +19,10 @@ export interface AuditEntry {
 	source: Decision["source"];
 	rules: string[];
 	scores?: Record<string, number>;
+	/** The confirm and block thresholds each score was held to (block is omitted when it never applies) */
+	thresholds?: Record<string, { confirm: number; block?: number }>;
+	/** Caveats the human is shown, for example that authorization was not assessed */
+	notes?: string[];
 	judgeError?: true;
 	/** Present when the human was asked */
 	confirmed?: boolean;
@@ -30,6 +34,11 @@ export interface GuardDeps {
 	turnBuffer: TurnBuffer;
 	/** Receives an entry for every decision worth recording */
 	audit: (entry: AuditEntry) => void;
+	/**
+	 * Receives an entry for every call that goes ahead, whether or not it is worth
+	 * recording: allowed outright, or approved by the human. For display only
+	 */
+	trace?: (entry: AuditEntry) => void;
 	/** Undefined when no decision model is configured */
 	judge?: (input: JudgeInput) => Promise<JudgeVerdict>;
 	/** This process was started by another model (a subagent), so its "user" messages are not the user's */
@@ -120,6 +129,19 @@ function declineReason(decision: Decision, d: Descriptor): string {
 	].join("\n\n");
 }
 
+function thresholdsOf(verdict: JudgeVerdict | undefined, policy: Policy): AuditEntry["thresholds"] {
+	if (!verdict || !policy.judge || Object.keys(verdict.scores).length === 0) return undefined;
+	const out: NonNullable<AuditEntry["thresholds"]> = {};
+	for (const dimension of Object.keys(verdict.scores)) {
+		const t = thresholdFor(dimension, policy.judge.thresholds);
+		// Infinity (a block threshold that never applies) is not representable in JSON
+		out[dimension] = Number.isFinite(t.block)
+			? { confirm: t.confirm, block: t.block }
+			: { confirm: t.confirm };
+	}
+	return out;
+}
+
 const ABORTED: GuardResult = { block: true, reason: "Operation aborted." };
 
 export function createGuard(deps: GuardDeps) {
@@ -127,6 +149,15 @@ export function createGuard(deps: GuardDeps) {
 	const audit = (entry: AuditEntry) => {
 		try {
 			deps.audit(entry);
+		} catch {
+			// ignore
+		}
+	};
+
+	/** Display only, so a failure here must never reach the call. */
+	const trace = (entry: AuditEntry) => {
+		try {
+			deps.trace?.(entry);
 		} catch {
 			// ignore
 		}
@@ -153,6 +184,8 @@ export function createGuard(deps: GuardDeps) {
 			source: decision.source,
 			rules: decision.matched.map((m) => m.id),
 			scores: decision.verdict?.scores,
+			thresholds: thresholdsOf(decision.verdict, deps.policy),
+			notes: decision.verdict?.notes,
 			judgeError: decision.verdict?.error,
 		};
 		const worthLogging =
@@ -160,6 +193,7 @@ export function createGuard(deps: GuardDeps) {
 
 		if (decision.outcome === "allow") {
 			if (worthLogging) audit(entry);
+			trace(entry);
 			return undefined;
 		}
 
@@ -185,6 +219,7 @@ export function createGuard(deps: GuardDeps) {
 		});
 		if (ctx.signal?.aborted) return ABORTED;
 		audit({ ...entry, confirmed });
+		if (confirmed) trace({ ...entry, confirmed });
 		return confirmed ? undefined : { block: true, reason: declineReason(decision, d) };
 	}
 
