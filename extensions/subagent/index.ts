@@ -18,7 +18,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
-import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	CONFIG_DIR_NAME,
 	type ExtensionAPI,
@@ -478,7 +477,9 @@ const ChainItem = Type.Object({
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
 
-const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
+const AgentScopeSchema = Type.Unsafe<AgentScope>({
+	type: "string",
+	enum: ["user", "project", "both"],
 	description:
 		'Which agent directories to use. Default: "user". Use "both" to include project-local agents.',
 	default: "user",
