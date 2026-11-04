@@ -1,7 +1,6 @@
 /**
- * Replay bash/write/edit calls from pi session logs through the Layer 1 rules
- * and report how often each rule fires, with samples. Used to calibrate the
- * shipped rules against real usage (false positives especially).
+ * Replay recorded tool calls from pi session logs through the effect policy and
+ * report what would be allowed, asked, or blocked.
  *
  *   node scripts/replay-sessions.ts [sessions-dir] [--samples N]
  *
@@ -11,10 +10,9 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { isAllowlisted } from "../extensions/command-guard/allowlist.ts";
-import { buildPolicy } from "../extensions/command-guard/config.ts";
 import { describeToolCall } from "../extensions/command-guard/descriptor.ts";
-import { matchRules } from "../extensions/command-guard/match.ts";
+import { buildPolicy, decide } from "../extensions/command-guard/policy.ts";
+import type { Policy } from "../extensions/command-guard/types.ts";
 
 const args = process.argv.slice(2);
 const sampleFlag = args.indexOf("--samples");
@@ -31,12 +29,21 @@ function* jsonlFiles(dir: string): Generator<string> {
 	}
 }
 
-const policy = buildPolicy({});
+const policies = new Map<string, Policy>();
+function policyFor(cwd: string): Policy {
+	const cached = policies.get(cwd);
+	if (cached) return cached;
+	const policy = buildPolicy({ cwd, home });
+	policies.set(cwd, policy);
+	return policy;
+}
+
 const counts = new Map<string, number>();
 const examples = new Map<string, string[]>();
 let total = 0;
-let allowlisted = 0;
-let flagged = 0;
+let allow = 0;
+let ask = 0;
+let blocked = 0;
 
 for (const file of jsonlFiles(root)) {
 	let cwd = home;
@@ -57,32 +64,23 @@ for (const file of jsonlFiles(root)) {
 			const d = describeToolCall({ toolName: block.name, input: block.arguments }, cwd, home);
 			if (!d) continue;
 			total++;
-			const matched = matchRules(policy.rules, d, { allowedHosts: policy.allowedHosts, home });
-			if (matched.length === 0) {
-				if (
-					d.tool === "bash" &&
-					isAllowlisted(d.command ?? "", { cwd, home, entries: policy.allowlist.entries })
-				) {
-					allowlisted++;
-				}
-				continue;
+			const decision = decide(d, policyFor(cwd));
+			if (decision.outcome === "allow") allow++;
+			else if (decision.outcome === "ask") ask++;
+			else blocked++;
+			const key = `${decision.outcome}: ${decision.cause}`;
+			counts.set(key, (counts.get(key) ?? 0) + 1);
+			const list = examples.get(key) ?? [];
+			if (list.length < samples) {
+				list.push((d.command ?? `${d.tool} ${d.paths[0]}`).replace(/\s+/g, " ").slice(0, 160));
 			}
-			flagged++;
-			for (const m of matched) {
-				counts.set(m.id, (counts.get(m.id) ?? 0) + 1);
-				const list = examples.get(m.id) ?? [];
-				if (list.length < samples) {
-					list.push((d.command ?? `${d.tool} ${d.paths[0]}`).replace(/\s+/g, " ").slice(0, 160));
-				}
-				examples.set(m.id, list);
-			}
+			examples.set(key, list);
 		}
 	}
 }
 
-console.log(`calls: ${total}, flagged by rules: ${flagged}, allowlist fast-path: ${allowlisted}`);
-for (const [id, n] of [...counts.entries()].sort((a, b) => b[1] - a[1])) {
-	const rule = policy.rules.find((r) => r.id === id);
-	console.log(`\n${String(n).padStart(4)}  ${id}  [${rule?.rule.category}]`);
-	for (const ex of examples.get(id) ?? []) console.log(`        ${ex}`);
+console.log(`calls: ${total}, allow: ${allow}, ask: ${ask}, block: ${blocked}`);
+for (const [key, n] of [...counts.entries()].sort((a, b) => b[1] - a[1])) {
+	console.log(`\n${String(n).padStart(4)}  ${key}`);
+	for (const ex of examples.get(key) ?? []) console.log(`        ${ex}`);
 }

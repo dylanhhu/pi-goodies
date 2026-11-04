@@ -250,3 +250,85 @@ describe("allowlist: flags that follow symlinks or run programs", () => {
 		assert.equal(ok("git show HEAD:src/a.ts"), true);
 	});
 });
+
+describe("allowlist: sed is allowed only through its script validator", () => {
+	test("read-only scripts pass", () => {
+		for (const cmd of [
+			"sed -n 30,140p README.md",
+			"sed -n 1p src/a.ts",
+			"sed s/a/b/ src/a.ts",
+			"sed -n -e 1p -e 2p src/a.ts",
+			"sed -ne 1p src/a.ts",
+			"sed -n /foo/p src/a.ts",
+		]) {
+			assert.equal(ok(cmd), true, cmd);
+		}
+	});
+
+	test("scripts that write, read, or execute are refused", () => {
+		for (const cmd of [
+			"sed 1w/tmp/x README.md",
+			"sed -n w/tmp/x README.md",
+			"sed -n r/etc/passwd README.md",
+			"sed -n s/a/b/w out README.md",
+			"sed -n e id README.md",
+			"sed -i s/a/b/ README.md",
+			"sed -i.bak s/a/b/ README.md",
+			"sed -f script.sed README.md",
+			"sed --file=script.sed README.md",
+		]) {
+			assert.equal(ok(cmd), false, cmd);
+		}
+	});
+
+	test("input files are still path-checked", () => {
+		assert.equal(ok("sed -n 1p .env"), false);
+		assert.equal(ok("sed -n 1p ~/.ssh/id_rsa"), false);
+		assert.equal(ok("sed -n 1p src/.env.example"), true);
+	});
+
+	test("a quoted script is not plain, so the allowlist still refuses it", () => {
+		assert.equal(ok("sed -n '30,140p' README.md"), false);
+	});
+});
+
+describe("allowlist: recursive readers and their arguments on disk", () => {
+	function fixture() {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "cg-rr-")));
+		const home = join(root, "home");
+		const proj = join(root, "proj");
+		mkdirSync(join(home, ".ssh"), { recursive: true });
+		mkdirSync(join(proj, "src"), { recursive: true });
+		writeFileSync(join(home, ".zshrc"), "export PATH=.");
+		writeFileSync(join(proj, "a.ts"), "x");
+		writeFileSync(join(proj, "src", "b.ts"), "y");
+		const run = (cmd: string, cwd = home) =>
+			isAllowlisted(cmd, { cwd, home, entries: DEFAULT_ALLOWLIST });
+		return { root, home, proj, run };
+	}
+
+	test("a named file means the cwd is not being recursed into", () => {
+		const { run, proj } = fixture();
+		// Reading one file from home is fine, even though home holds secrets
+		assert.equal(run("grep -n PATH ~/.zshrc"), true);
+		assert.equal(run(`rg -n x ${join(proj, "a.ts")}`), true);
+	});
+
+	test("no path argument leaves the cwd as the target", () => {
+		const { run } = fixture();
+		assert.equal(run("grep -rn PATH"), false);
+		assert.equal(run("rg -n x"), false);
+	});
+
+	test("a named directory is checked, and the cwd is not added", () => {
+		const { run, proj } = fixture();
+		assert.equal(run(`grep -rn x ${join(proj, "src")}`), true);
+		assert.equal(run(`grep -rn x ${join(proj, "src")} ~`), false);
+	});
+
+	test("find names its own directory, so the cwd is irrelevant", () => {
+		const { run, proj } = fixture();
+		assert.equal(run(`find ${join(proj, "src")} -name a.ts`), true);
+		assert.equal(run("find -name a.ts"), false);
+	});
+});

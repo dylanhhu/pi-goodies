@@ -1,28 +1,18 @@
 /**
- * Permission modes: how strictly command-guard enforces its policy for the
- * current session, switched by the human with `/permissions [mode]`.
+ * Permission modes: whether the guard runs at all.
  *
- * A mode is one of two things, and a future mode can use either:
- *
- *   - `bypass`: the guard does not run at all. No rule, allowlist, decision
- *     model, or dialog is consulted, so nothing in the pipeline can block
- *   - `apply`: derives the policy to enforce from the one built from config,
- *     for example by tightening `unmatched`. The pipeline is otherwise unchanged
- *
- * To add a mode, append it to PERMISSION_MODES.
+ * A mode is either the default policy or `bypass`, which skips every part of
+ * the guard. The mode is per session, set only by the human, and never read
+ * from config or a session file except on `/reload`.
  */
-
-import type { Policy } from "./config.ts";
 
 export interface PermissionMode {
 	/** What the human types after `/permissions` */
 	name: string;
 	description: string;
-	/** Skip the guard entirely. `apply` is then not used */
+	/** Skip the guard entirely */
 	bypass?: boolean;
-	/** Derive the enforced policy from the configured one. Must not mutate its argument */
-	apply?: (policy: Policy) => Policy;
-	/** Footer status text while this mode is active. Omit to show nothing */
+	/** Footer status text while this mode is active */
 	badge?: string;
 	/** Shown when the human switches to this mode */
 	warning?: string;
@@ -30,16 +20,16 @@ export interface PermissionMode {
 
 export const DEFAULT_MODE: PermissionMode = {
 	name: "default",
-	description: "Enforce the configured rules, allowlist, and decision model",
+	description: "Enforce the effect policy",
 };
 
 export const YOLO_MODE: PermissionMode = {
 	name: "yolo",
-	description: "Bypass command-guard entirely: nothing is blocked, judged, or confirmed",
+	description: "Bypass command-guard entirely: nothing is blocked or confirmed",
 	bypass: true,
 	badge: "YOLO",
 	warning:
-		"command-guard is bypassed for this session: nothing will be blocked, judged, or confirmed, including its own protection of command-guard's files and config. Run /permissions default to turn it back on.",
+		"command-guard is bypassed for this session: nothing will be blocked or confirmed, including its own protection of command-guard's files and config. Run /permissions default to turn it back on.",
 };
 
 export const PERMISSION_MODES: readonly PermissionMode[] = [DEFAULT_MODE, YOLO_MODE];
@@ -47,11 +37,6 @@ export const PERMISSION_MODES: readonly PermissionMode[] = [DEFAULT_MODE, YOLO_M
 /** Looked up by array search, so names such as "constructor" never resolve to anything. */
 export function getMode(name: string): PermissionMode | undefined {
 	return PERMISSION_MODES.find((mode) => mode.name === name);
-}
-
-/** The policy a mode enforces. */
-export function enforcedPolicy(mode: PermissionMode, policy: Policy): Policy {
-	return mode.apply ? mode.apply(policy) : policy;
 }
 
 /** Session entry type that records mode switches. */

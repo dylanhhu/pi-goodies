@@ -95,9 +95,15 @@ describe("describeToolCall", () => {
 		assert.deepEqual(d?.paths, [join(root, "real", "f.txt")]);
 	});
 
+	test("read resolves its path", () => {
+		const d = describeToolCall({ toolName: "read", input: { path: "a" } }, CWD, HOME);
+		assert.equal(d?.tool, "read");
+		assert.deepEqual(d?.paths, ["/Users/me/proj/a"]);
+	});
+
 	test("other tools and malformed input are out of scope", () => {
 		assert.equal(
-			describeToolCall({ toolName: "read", input: { path: "a" } }, CWD, HOME),
+			describeToolCall({ toolName: "grep", input: { path: "a" } }, CWD, HOME),
 			undefined,
 		);
 		assert.equal(describeToolCall({ toolName: "bash", input: {} }, CWD, HOME), undefined);

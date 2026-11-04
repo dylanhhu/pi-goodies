@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
+	extractCdTargets,
 	extractHosts,
 	extractWriteTargets,
+	shellScanText,
 	stripInertHeredocs,
 } from "../../extensions/command-guard/extract.ts";
 
@@ -351,5 +353,40 @@ describe("extractWriteTargets: more writers", () => {
 		assert.deepEqual(targets('sh -c "echo x > ~/.bashrc"'), ["/Users/me/.bashrc"]);
 		assert.deepEqual(targets("timeout 5 bash -c 'rm -rf ~/.ssh'"), ["/Users/me/.ssh"]);
 		assert.deepEqual(targets("eval 'tee ~/.zshrc'"), ["/Users/me/.zshrc"]);
+	});
+});
+
+describe("extractWriteTargets: cd is followed", () => {
+	test("relative targets resolve against the directory the command moves into", () => {
+		assert.deepEqual(targets("cd /tmp && echo x > y"), ["/tmp/y"]);
+		assert.deepEqual(targets("cd sub && echo x > y"), ["/Users/me/proj/sub/y"]);
+		assert.deepEqual(targets("cd ~ && echo x > .zshrc"), ["/Users/me/.zshrc"]);
+		assert.deepEqual(targets("cd /tmp && cd sub && rm -rf x"), ["/tmp/sub/x"]);
+	});
+
+	test("the directories a line changes into are reported in order", () => {
+		assert.deepEqual(extractCdTargets("cd /tmp && cd sub && ls", CWD, HOME), ["/tmp", "/tmp/sub"]);
+		assert.deepEqual(extractCdTargets("cd ~", CWD, HOME), ["/Users/me"]);
+		assert.deepEqual(extractCdTargets("cd -", CWD, HOME), []);
+	});
+});
+
+describe("extractWriteTargets: git destinations", () => {
+	test("clone and worktree add name their destination", () => {
+		assert.deepEqual(targets("git clone https://github.com/a/b /tmp/x"), ["/tmp/x"]);
+		assert.deepEqual(targets("git clone https://github.com/a/b"), []);
+		assert.deepEqual(targets("git worktree add ../other"), ["/Users/me/other"]);
+	});
+});
+
+describe("shellScanText", () => {
+	test("interpreter bodies are code, not shell commands", () => {
+		assert.ok(!shellScanText("python3 - <<'PY'\nrm -rf /\nPY").includes("rm -rf"));
+		assert.ok(!shellScanText("node - <<'JS'\nrequire('child_process')\nJS").includes("require"));
+	});
+
+	test("shell bodies are still scanned", () => {
+		assert.ok(shellScanText("bash <<'EOF'\nrm -rf /\nEOF").includes("rm -rf"));
+		assert.ok(shellScanText("cat <<'EOF' | sh\nrm -rf /\nEOF").includes("rm -rf"));
 	});
 });

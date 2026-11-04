@@ -1,48 +1,30 @@
 /**
- * Turns decisions into tool_call results: runs the pipeline, asks the human
+ * Turns a decision into a tool_call result: runs the policy, opens a dialog
  * when needed, and words every refusal so the model cannot mistake it for a
  * transient failure.
  */
 
-import type { Policy } from "./config.ts";
-import { type Decision, decide } from "./decide.ts";
 import { describeToolCall } from "./descriptor.ts";
-import { type JudgeInput, type JudgeVerdict, thresholdFor } from "./judge.ts";
-import type { TurnBuffer } from "./turn-buffer.ts";
-import type { Descriptor } from "./types.ts";
+import { decide } from "./policy.ts";
+import type { Decision, Descriptor, Policy } from "./types.ts";
 
 export interface AuditEntry {
 	tool: string;
-	/** Correlates the entry with the tool call in the session */
 	toolCallId: string;
 	outcome: Decision["outcome"];
 	source: Decision["source"];
-	rules: string[];
-	scores?: Record<string, number>;
-	/** The confirm and block thresholds each score was held to (block is omitted when it never applies) */
-	thresholds?: Record<string, { confirm: number; block?: number }>;
-	/** Caveats the human is shown, for example that authorization was not assessed */
-	notes?: string[];
-	judgeError?: true;
+	cause: string;
+	detail?: string;
+	targets?: string[];
+	hosts?: string[];
 	/** Present when the human was asked */
 	confirmed?: boolean;
 }
 
 export interface GuardDeps {
 	policy: Policy;
-	home: string;
-	turnBuffer: TurnBuffer;
-	/** Receives an entry for every decision worth recording */
+	/** Receives an entry for every call that asked or was refused */
 	audit: (entry: AuditEntry) => void;
-	/**
-	 * Receives an entry for every call that goes ahead, whether or not it is worth
-	 * recording: allowed outright, or approved by the human. For display only
-	 */
-	trace?: (entry: AuditEntry) => void;
-	/** Undefined when no decision model is configured */
-	judge?: (input: JudgeInput) => Promise<JudgeVerdict>;
-	/** This process was started by another model (a subagent), so its "user" messages are not the user's */
-	delegated?: boolean;
 }
 
 export interface GuardToolCall {
@@ -66,7 +48,7 @@ export type GuardResult = { block: true; reason: string } | undefined;
 /** Longest action text handed back to the model. */
 const DISPLAY_MAX = 2_000;
 
-/** Keep the head and tail of long text for display; the full action is still what was judged. */
+/** Keep the head and tail of long text for display. */
 function clipForDisplay(text: string): string {
 	if (text.length <= DISPLAY_MAX) return text;
 	const head = Math.floor(DISPLAY_MAX * 0.6);
@@ -84,9 +66,9 @@ function summarize(d: Descriptor): string {
 }
 
 /**
- * The action shown in a confirm dialog. The transcript already holds the full command, so the
- * dialog shows only enough of its opening to tell apart calls issued in parallel; a long preview
- * would be clipped by the dialog itself, taking the Yes/No options off the screen with it.
+ * The action shown in a confirm dialog. The transcript already holds the full
+ * command, so the dialog shows only enough of its opening to tell apart calls
+ * issued in parallel.
  */
 const PREVIEW_LINES = 2;
 const PREVIEW_LINE_MAX = 100;
@@ -96,7 +78,6 @@ function more(n: number, noun: string): string {
 }
 
 function previewForDialog(text: string): string {
-	// Trailing blank lines say nothing about the action, and splitting would count them
 	const trimmed = text.trimEnd();
 	const lines = trimmed.split("\n");
 	const head = lines.slice(0, PREVIEW_LINES);
@@ -114,68 +95,80 @@ function previewForDialog(text: string): string {
 	return [...shown, `[… ${hidden.filter(Boolean).join(", ")}]`].join("\n");
 }
 
-/** Why the call was flagged, in a few words. */
-function cause(decision: Decision): string {
-	if (decision.source === "oversize" && decision.reason) return decision.reason;
-	if (decision.verdict) return decision.verdict.reason;
-	const labels = decision.matched.map((m) => m.rule.label ?? m.rule.pattern ?? m.id);
-	if (labels.length > 0) return [...new Set(labels)].join("; ");
-	return `policy for unmatched ${decision.source === "unmatched" ? "calls" : "actions"}`;
+/** A sentence explaining why the effect matters, when the cause is not obvious. */
+function explain(cause: string): string | undefined {
+	if (cause.startsWith("write outside"))
+		return "This is outside the project, so git cannot recover it.";
+	if (cause.startsWith("changes directory")) {
+		return "Relative paths in the command may point outside the project.";
+	}
+	if (cause === "sensitive path" || cause === "read a sensitive file") {
+		return "This is a credential, key, or secret file.";
+	}
+	if (cause === "protected path") return "This file belongs to command-guard or pi credentials.";
+	if (cause === "pi config or instructions") {
+		return "This changes pi's settings, extensions, skills, or instructions, which take effect later.";
+	}
+	if (cause === "persistence or executable project configuration") {
+		return "This changes something that can run later, such as a git hook, CI workflow, or editor task.";
+	}
+	if (cause.startsWith("network access")) {
+		return "The host is not on the fetch list. Add it to fetchHosts to allow fetches.";
+	}
+	if (cause === "data upload") return "Data sent out cannot be recalled.";
+	if (cause === "elevated privileges") return "This runs with root privileges.";
+	if (cause === "package installation") return "This installs software outside the project.";
+	if (cause.startsWith("persistence")) return "This changes something that runs later.";
+	if (cause === "process signal") return "This can terminate another process.";
+	if (cause === "remote shell or file transfer") return "This reaches another machine.";
+	if (cause === "service change" || cause === "scheduled task change") {
+		return "This changes something that runs later.";
+	}
+	if (cause === "system defaults change") return "This changes system-wide preferences.";
+	if (cause === "docker state change" || cause === "docker compose state change") {
+		return "This changes local containers, images, or volumes.";
+	}
+	if (cause === "GitHub state change" || cause === "API write") {
+		return "This changes state on a remote service.";
+	}
+	if (cause === "credential change") return "This changes stored credentials.";
+	if (cause.startsWith("mutation target")) {
+		return "The command mutates state but the guard could not tell where.";
+	}
+	if (cause === "force push") return "This rewrites history on the remote.";
+	if (cause.startsWith("git ")) return "This can discard work that git cannot recover.";
+	return undefined;
+}
+
+function titleFor(cause: string): string {
+	return cause.charAt(0).toUpperCase() + cause.slice(1);
 }
 
 function blockReason(decision: Decision, d: Descriptor): string {
-	// Legacy rules carry the model-facing reason in `message`
-	if (decision.source === "rule" && decision.rule?.rule.message) return decision.rule.rule.message;
-	const advice =
-		decision.source === "oversize"
-			? "This action is too large to be reviewed automatically. If it is truly needed, explain why to the user and let them run or approve it; do not split it up just to get under the limit."
-			: "This is a policy block, not a transient or environment error. Do not retry it, and do not retry the same operation rewritten to avoid the match. If the action is truly needed, explain why to the user and let them decide.";
 	return [
-		`Blocked by command-guard: ${cause(decision)}.`,
-		advice,
+		`Blocked by command-guard: ${decision.cause}${decision.detail ? ` (${decision.detail})` : ""}.`,
+		"This is a policy block, not a transient or environment error. Do not retry it, and do not retry the same operation rewritten to avoid the match. If the action is truly needed, explain why to the user and let them decide.",
 		`Action that was blocked:\n${summarize(d)}`,
 	].join("\n\n");
 }
 
-function confirmMessage(decision: Decision, d: Descriptor): string {
-	// Legacy rules carry the human-facing question in `message`
-	if (decision.source === "rule" && decision.rule?.rule.message && !decision.verdict) {
-		return decision.rule.rule.message;
-	}
-	const lines = [cause(decision)];
-	if (decision.reason && decision.source !== "oversize") lines.push(`(${decision.reason})`);
-	if (decision.verdict && Object.keys(decision.verdict.scores).length > 0) {
-		const scores = Object.entries(decision.verdict.scores)
-			.map(([k, v]) => `${k} ${v.toFixed(2)}`)
-			.join(", ");
-		lines.push(`Scores: ${scores}`);
-	}
-	for (const note of decision.verdict?.notes ?? []) lines.push(`Note: ${note}`);
-	lines.push("", previewForDialog(actionText(d)), "", "Allow?");
-	return lines.join("\n");
-}
-
 function declineReason(decision: Decision, d: Descriptor): string {
-	if (decision.rule?.rule.denyMessage) return decision.rule.rule.denyMessage;
 	return [
-		`The user declined to run this action (${cause(decision)}); it did not execute.`,
+		`The user declined to run this action (${decision.cause}); it did not execute.`,
 		"This is a refusal by the user, not an environment, permission, or syntax error, and not a temporary failure.",
-		"Do not retry it, and do not retry the same operation rewritten to avoid the matched pattern.",
+		"Do not retry it, and do not retry the same operation rewritten to avoid the check.",
 		`Action that was refused:\n${summarize(d)}`,
 	].join("\n\n");
 }
 
-function thresholdsOf(verdict: JudgeVerdict | undefined, policy: Policy): AuditEntry["thresholds"] {
-	if (!verdict || !policy.judge || Object.keys(verdict.scores).length === 0) return undefined;
-	const out: NonNullable<AuditEntry["thresholds"]> = {};
-	for (const dimension of Object.keys(verdict.scores)) {
-		const t = thresholdFor(dimension, policy.judge.thresholds);
-		// Infinity (a block threshold that never applies) is not representable in JSON
-		out[dimension] = Number.isFinite(t.block)
-			? { confirm: t.confirm, block: t.block }
-			: { confirm: t.confirm };
-	}
-	return out;
+function confirmMessage(decision: Decision, d: Descriptor): string {
+	const lines = [
+		decision.detail ? `${titleFor(decision.cause)}: ${decision.detail}` : titleFor(decision.cause),
+	];
+	const note = explain(decision.cause);
+	if (note) lines.push(note);
+	lines.push("", previewForDialog(actionText(d)), "", "Allow?");
+	return lines.join("\n");
 }
 
 const ABORTED: GuardResult = { block: true, reason: "Operation aborted." };
@@ -190,72 +183,50 @@ export function createGuard(deps: GuardDeps) {
 		}
 	};
 
-	/** Display only, so a failure here must never reach the call. */
-	const trace = (entry: AuditEntry) => {
-		try {
-			deps.trace?.(entry);
-		} catch {
-			// ignore
-		}
-	};
-
 	async function evaluate(event: GuardToolCall, ctx: GuardContext): Promise<GuardResult> {
-		const d = describeToolCall(event, ctx.cwd, deps.home);
-		if (!d) return undefined;
-
-		const decision = await decide(d, deps.policy, {
-			home: deps.home,
-			userMessages: () => deps.turnBuffer.messages(),
-			delegated: deps.delegated,
-			judge: deps.judge,
-			signal: ctx.signal,
-		});
-		// The user cancelled while the decision model was thinking: do not open a dialog now
 		if (ctx.signal?.aborted) return ABORTED;
+		const d = describeToolCall(event, ctx.cwd, deps.policy.home);
+		if (!d) {
+			return {
+				block: true,
+				reason:
+					"Blocked by command-guard: the tool input could not be understood, so it cannot be checked. Do not retry; tell the user.",
+			};
+		}
 
+		const decision = decide(d, deps.policy);
 		const entry: AuditEntry = {
 			tool: d.tool,
 			toolCallId: event.toolCallId,
 			outcome: decision.outcome,
 			source: decision.source,
-			rules: decision.matched.map((m) => m.id),
-			scores: decision.verdict?.scores,
-			thresholds: thresholdsOf(decision.verdict, deps.policy),
-			notes: decision.verdict?.notes,
-			judgeError: decision.verdict?.error,
+			cause: decision.cause,
+			detail: decision.detail,
+			targets: decision.targets,
+			hosts: decision.hosts,
 		};
-		const worthLogging =
-			decision.source === "rule" || decision.source === "judge" || decision.source === "oversize";
 
-		if (decision.outcome === "allow") {
-			if (worthLogging) audit(entry);
-			trace(entry);
-			return undefined;
-		}
+		if (decision.outcome === "allow") return undefined;
 
 		if (decision.outcome === "block") {
 			audit(entry);
 			return { block: true, reason: blockReason(decision, d) };
 		}
 
-		// confirm
+		// ask
+		if (ctx.signal?.aborted) return ABORTED;
 		if (!ctx.hasUI) {
 			audit(entry);
 			return {
 				block: true,
-				reason: `Blocked by command-guard: ${cause(decision)}. This action needs the user's confirmation, but no UI is available to ask (non-interactive mode), so it cannot be confirmed. Do not retry.`,
+				reason: `Blocked by command-guard: ${decision.cause}. This action needs the user's confirmation, but no UI is available to ask (non-interactive mode), so it cannot be confirmed. Do not retry.`,
 			};
 		}
-		const title =
-			decision.source === "oversize"
-				? "Oversized action"
-				: (decision.rule?.rule.label ?? "command-guard");
-		const confirmed = await ctx.ui.confirm(title, confirmMessage(decision, d), {
+		const confirmed = await ctx.ui.confirm(titleFor(decision.cause), confirmMessage(decision, d), {
 			signal: ctx.signal,
 		});
 		if (ctx.signal?.aborted) return ABORTED;
 		audit({ ...entry, confirmed });
-		if (confirmed) trace({ ...entry, confirmed });
 		return confirmed ? undefined : { block: true, reason: declineReason(decision, d) };
 	}
 

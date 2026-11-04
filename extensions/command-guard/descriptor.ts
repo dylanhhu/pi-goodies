@@ -1,12 +1,12 @@
-/** Normalize a tool call into the Descriptor the rules and judge work on. */
+/** Normalize a tool call into the Descriptor the policy works on. */
 
 import { resolve } from "node:path";
-import { extractHosts, extractWriteTargets, stripInertHeredocs } from "./extract.ts";
+import { extractHosts, extractWriteTargets, shellScanText } from "./extract.ts";
 import { realResolve } from "./paths.ts";
 import type { Descriptor } from "./types.ts";
 
 export function describeBash(command: string, cwd: string, home: string): Descriptor {
-	const scanText = stripInertHeredocs(command);
+	const scanText = shellScanText(command);
 	return {
 		tool: "bash",
 		cwd,
@@ -66,6 +66,10 @@ export function describeToolCall(
 		case "write":
 		case "edit":
 			return describeFile(event.toolName, input, cwd, home);
+		case "read":
+			return typeof input.path === "string"
+				? { tool: "read", cwd, hosts: [], paths: [toolPath(input.path, cwd, home)] }
+				: undefined;
 		default:
 			return undefined;
 	}
