@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { type AuditEntry, createGuard } from "../../extensions/command-guard/guard.ts";
+import type { GuardModel, ModelDecision } from "../../extensions/command-guard/model.ts";
 import { buildPolicy } from "../../extensions/command-guard/policy.ts";
 import type { GuardConfig } from "../../extensions/command-guard/types.ts";
 
@@ -21,6 +22,9 @@ function setup(
 		approve?: boolean;
 		auditThrows?: boolean;
 		signal?: AbortSignal;
+		model?: GuardModel;
+		userMessages?: string[];
+		delegated?: boolean;
 		onConfirm?: (title: string, message: string) => Promise<boolean>;
 	} = {},
 ) {
@@ -38,6 +42,9 @@ function setup(
 			if (opts.auditThrows) throw new Error("disk full");
 			audit.push(entry);
 		},
+		model: opts.model,
+		userMessages: () => opts.userMessages ?? [],
+		delegated: opts.delegated,
 	});
 	const ctx = {
 		cwd: CWD,
@@ -213,5 +220,142 @@ describe("guard: failures never change the outcome", () => {
 		const r = await call("bash", {});
 		assert.equal(r?.block, true);
 		assert.match(r?.reason ?? "", /could not be understood/);
+	});
+});
+
+function modelMock(
+	opts: { risk?: ModelDecision; scope?: ModelDecision } = {},
+): GuardModel & { riskCalls: number; scopeCalls: number } {
+	const mock = {
+		riskCalls: 0,
+		scopeCalls: 0,
+		async opaqueRisk() {
+			mock.riskCalls++;
+			return opts.risk ?? { outcome: "allow", cause: "clean" };
+		},
+		async scope() {
+			mock.scopeCalls++;
+			return opts.scope ?? { outcome: "ask", cause: "not authorized" };
+		},
+	};
+	return mock;
+}
+
+describe("guard: opaque risk", () => {
+	const script = "python3 - <<'PY'\nprint(1)\nPY";
+
+	test("a hidden effect escalates a static allow to a dialog", async () => {
+		const model = modelMock({
+			risk: { outcome: "ask", cause: "opaque code risk", detail: "hiddenWrite 0.81" },
+		});
+		const { call, dialogs, audit } = setup({ model, approve: false });
+		const r = await call("bash", bash(script));
+		assert.equal(r?.block, true);
+		assert.equal(dialogs.length, 1);
+		assert.equal(dialogs[0].title, "Opaque code risk");
+		assert.match(dialogs[0].message, /hiddenWrite 0\.81/);
+		assert.equal(model.riskCalls, 1);
+		assert.equal(audit[0].source, "opaque-risk");
+	});
+
+	test("a block from the risk check does not open a dialog", async () => {
+		const model = modelMock({
+			risk: { outcome: "block", cause: "opaque code risk", detail: "destructive 0.96" },
+		});
+		const { call, dialogs } = setup({ model });
+		const r = await call("bash", bash(script));
+		assert.equal(r?.block, true);
+		assert.match(r?.reason ?? "", /opaque code risk/);
+		assert.equal(dialogs.length, 0);
+	});
+
+	test("a clean script stays allowed", async () => {
+		const model = modelMock();
+		const { call, dialogs } = setup({ model });
+		assert.equal(await call("bash", bash(script)), undefined);
+		assert.equal(dialogs.length, 0);
+		assert.equal(model.riskCalls, 1);
+	});
+
+	test("ordinary reads, workspace writes, and unknown binaries never reach the model", async () => {
+		const model = modelMock();
+		const { call } = setup({ model });
+		await call("bash", bash("ls -la"));
+		await call("bash", bash("echo x > out.txt"));
+		await call("bash", bash("kicad-cli pcb export --help"));
+		await call("read", { path: "README.md" });
+		assert.equal(model.riskCalls, 0);
+		assert.equal(model.scopeCalls, 0);
+	});
+
+	test("the floor is final and never reaches the model", async () => {
+		const model = modelMock({
+			risk: { outcome: "allow", cause: "clean" },
+			scope: { outcome: "allow", cause: "authorized by the task" },
+		});
+		const { call, dialogs } = setup({ model });
+		const r = await call("bash", bash("rm -rf /"));
+		assert.equal(r?.block, true);
+		assert.equal(model.riskCalls, 0);
+		assert.equal(model.scopeCalls, 0);
+		assert.equal(dialogs.length, 0);
+	});
+});
+
+describe("guard: scope suppression", () => {
+	const skillWrite = { path: "~/.agents/skills/kicad/SKILL.md", content: "x" };
+
+	test("a task that names the effect suppresses the ask", async () => {
+		const model = modelMock({ scope: { outcome: "allow", cause: "authorized by the task" } });
+		const { call, dialogs, audit } = setup({
+			model,
+			userMessages: ["create a kicad skill"],
+		});
+		assert.equal(await call("write", skillWrite), undefined);
+		assert.equal(dialogs.length, 0);
+		assert.equal(model.scopeCalls, 1);
+		assert.equal(audit.at(-1)?.source, "scope");
+		assert.equal(audit.at(-1)?.outcome, "allow");
+	});
+
+	test("the model is not asked without a lexical anchor", async () => {
+		const model = modelMock({ scope: { outcome: "allow", cause: "authorized by the task" } });
+		const { call, dialogs } = setup({ model, userMessages: ["just do the task"] });
+		const r = await call("write", skillWrite);
+		assert.equal(r?.block, true);
+		assert.equal(dialogs.length, 1);
+		assert.equal(model.scopeCalls, 0);
+	});
+
+	test("a low-confidence scope answer keeps the ask", async () => {
+		const model = modelMock({ scope: { outcome: "ask", cause: "not clearly authorized" } });
+		const { call, dialogs } = setup({ model, userMessages: ["create a kicad skill"] });
+		await call("write", skillWrite);
+		assert.equal(dialogs.length, 1);
+		assert.equal(model.scopeCalls, 1);
+	});
+
+	test("privilege and sensitive paths never reach the scope check", async () => {
+		const model = modelMock({ scope: { outcome: "allow", cause: "authorized by the task" } });
+		const { call, dialogs } = setup({
+			model,
+			userMessages: ["run sudo and read .env"],
+		});
+		await call("bash", bash("sudo ls"));
+		await call("read", { path: ".env" });
+		assert.equal(model.scopeCalls, 0);
+		assert.equal(dialogs.length, 2);
+	});
+
+	test("a delegated run does not treat its task text as the user's words", async () => {
+		const model = modelMock({ scope: { outcome: "allow", cause: "authorized by the task" } });
+		const { call, dialogs } = setup({
+			model,
+			userMessages: ["create a kicad skill"],
+			delegated: true,
+		});
+		await call("write", skillWrite);
+		assert.equal(model.scopeCalls, 0);
+		assert.equal(dialogs.length, 1);
 	});
 });

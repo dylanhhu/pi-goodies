@@ -9,6 +9,8 @@ import {
 	decide,
 	loadConfigFile,
 	parseConfig,
+	scopeAnchor,
+	scopeEligible,
 } from "../../extensions/command-guard/policy.ts";
 import type { Descriptor, Policy } from "../../extensions/command-guard/types.ts";
 
@@ -44,7 +46,7 @@ describe("config", () => {
 			home: HOME,
 			config: { writeRoots: ["~/.agents", "~", "/"] },
 		});
-		assert.deepEqual(p.writeRoots, ["/Users/me/.agents"]);
+		assert.deepEqual(p.writeRoots, ["/Users/me/.worktrees", "/Users/me/.agents"]);
 		assert.ok(p.warnings.some((w) => /home directory or root/.test(w)));
 	});
 
@@ -65,6 +67,48 @@ describe("config", () => {
 		assert.ok(warnings.some((w) => /unknown config field "extra"/.test(w)));
 		assert.ok(warnings.some((w) => /writeRoots must be an array/.test(w)));
 		assert.ok(warnings.some((w) => /allowGitPush must be a boolean/.test(w)));
+	});
+
+	test("a classifier config resolves with risk-tolerant defaults", () => {
+		const parsed = parseConfig({ classifier: { model: "provider/model", timeoutMs: 2500 } }, []);
+		const p = policy({ config: parsed });
+		assert.equal(p.classifier?.model, "provider/model");
+		assert.equal(p.classifier?.timeoutMs, 2500);
+		assert.deepEqual(p.classifier?.opaqueRisk, {
+			enabled: true,
+			ask: 0.6,
+			block: 0.92,
+			onError: "keep",
+		});
+		assert.deepEqual(p.classifier?.scope, {
+			enabled: true,
+			threshold: 0.65,
+			onError: "ask",
+		});
+	});
+
+	test("classifier thresholds and onError are validated", () => {
+		const warnings: string[] = [];
+		const parsed = parseConfig(
+			{
+				classifier: {
+					model: "provider/model",
+					opaqueRisk: { ask: 0.95, block: 0.9, onError: "nope" },
+					scope: { threshold: 2, onError: "keep" },
+					extra: true,
+				},
+			},
+			warnings,
+		);
+		const p = policy({ config: parsed });
+		const all = [...warnings, ...p.warnings];
+		assert.ok(all.some((w) => /opaqueRisk\.ask must be below block/.test(w)));
+		assert.ok(all.some((w) => /opaqueRisk\.onError/.test(w)));
+		assert.ok(all.some((w) => /scope\.threshold/.test(w)));
+		assert.ok(all.some((w) => /scope\.onError/.test(w)));
+		assert.ok(all.some((w) => /unknown classifier field "extra"/.test(w)));
+		assert.equal(p.classifier?.opaqueRisk.ask, 0.6);
+		assert.equal(p.classifier?.opaqueRisk.block, 0.92);
 	});
 
 	test("a missing config is fine; malformed JSON is a warning", () => {
@@ -124,6 +168,21 @@ describe("paths", () => {
 	test("an explicitly trusted root bypasses the config ask", () => {
 		const p = policy({ config: { writeRoots: ["~/.agents"] } });
 		assert.equal(file("write", "~/.agents/skills/a/SKILL.md", p).outcome, "allow");
+	});
+
+	test("the worktree root and generated directories do not ask", () => {
+		assert.equal(file("write", "~/.worktrees/repo/a.ts").outcome, "allow");
+		assert.equal(file("write", "/opt/project/node_modules/pkg/x.js").outcome, "allow");
+		assert.equal(file("write", "/tmp/proj/dist/bundle.js").outcome, "allow");
+	});
+
+	test("a newly created git worktree is recognized without a negative cache", () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "cg-new-git-")));
+		mkdirSync(join(root, "repo"));
+		const p = buildPolicy({ cwd: HOME, home: HOME });
+		assert.equal(file("write", join(root, "repo", "a.ts"), p).outcome, "ask");
+		mkdirSync(join(root, "repo", ".git"));
+		assert.equal(file("write", join(root, "repo", "a.ts"), p).outcome, "allow");
 	});
 
 	test("a git worktree is a recovery boundary", () => {
@@ -361,5 +420,103 @@ describe("bash: command table", () => {
 
 	test("chmod on home is blocked when it opens permissions recursively", () => {
 		assert.equal(bash("chmod -R 777 /").outcome, "block");
+	});
+});
+
+describe("scope eligibility and anchors", () => {
+	const p = policy();
+
+	test("an outside skill write is eligible and anchored by the path", () => {
+		const d = describeToolCall(
+			{
+				toolName: "write",
+				input: { path: "~/.agents/skills/kicad/SKILL.md", content: "x" },
+			},
+			p.cwd,
+			p.home,
+		) as Descriptor;
+		const decision = decide(d, p);
+		assert.equal(decision.cause, "pi config or instructions");
+		assert.equal(scopeEligible(decision, d, p), true);
+		assert.equal(scopeAnchor(decision, d, p, ["create a kicad skill"]), true);
+		assert.equal(scopeAnchor(decision, d, p, ["just fix the tests"]), false);
+	});
+
+	test("pi settings are not eligible, unlike the agents tree", () => {
+		const settings = describeToolCall(
+			{ toolName: "write", input: { path: "~/.pi/agent/settings.json", content: "x" } },
+			p.cwd,
+			p.home,
+		) as Descriptor;
+		const decision = decide(settings, p);
+		assert.equal(scopeEligible(decision, settings, p), false);
+	});
+
+	test("a new host is anchored by the host name", () => {
+		const d = describeBash("curl https://api.example.com/x", p.cwd, p.home);
+		const decision = decide(d, p);
+		assert.equal(decision.cause, "network access to a host not on the fetch list");
+		assert.equal(scopeEligible(decision, d, p), true);
+		assert.equal(scopeAnchor(decision, d, p, ["call api.example.com"]), true);
+		assert.equal(scopeAnchor(decision, d, p, ["call example.net"]), false);
+	});
+
+	test("a package install is anchored by the package or the action", () => {
+		const d = describeBash("npm install age", p.cwd, p.home);
+		const decision = decide(d, p);
+		assert.equal(decision.cause, "package installation");
+		assert.equal(scopeEligible(decision, d, p), true);
+		assert.equal(scopeAnchor(decision, d, p, ["install age"]), true);
+		assert.equal(scopeAnchor(decision, d, p, ["install dependencies"]), true);
+		assert.equal(scopeAnchor(decision, d, p, ["fix the tests"]), false);
+	});
+
+	test("privilege and sensitive paths never reach the scope model", () => {
+		const sudo = describeBash("sudo ls", p.cwd, p.home);
+		const sudoDecision = decide(sudo, p);
+		assert.equal(scopeEligible(sudoDecision, sudo, p), false);
+
+		const secret = describeToolCall(
+			{ toolName: "write", input: { path: ".env", content: "x" } },
+			p.cwd,
+			p.home,
+		) as Descriptor;
+		const secretDecision = decide(secret, p);
+		assert.equal(scopeEligible(secretDecision, secret, p), false);
+	});
+
+	test("git push and project persistence use operation anchors", () => {
+		const push = describeBash("git push", p.cwd, p.home);
+		const pushDecision = decide(push, p);
+		assert.equal(pushDecision.cause, "push to a remote");
+		assert.equal(scopeEligible(pushDecision, push, p), true);
+		assert.equal(scopeAnchor(pushDecision, push, p, ["push this branch"]), true);
+		assert.equal(scopeAnchor(pushDecision, push, p, ["fix the tests"]), false);
+
+		const ci = describeToolCall(
+			{ toolName: "edit", input: { path: ".github/workflows/ci.yml", edits: [] } },
+			p.cwd,
+			p.home,
+		) as Descriptor;
+		const ciDecision = decide(ci, p);
+		assert.equal(ciDecision.cause, "persistence or executable project configuration");
+		assert.equal(scopeEligible(ciDecision, ci, p), true);
+		assert.equal(scopeAnchor(ciDecision, ci, p, ["update the CI workflow"]), true);
+
+		const gitConfig = describeToolCall(
+			{ toolName: "write", input: { path: ".git/config", content: "x" } },
+			p.cwd,
+			p.home,
+		) as Descriptor;
+		const gitConfigDecision = decide(gitConfig, p);
+		assert.equal(gitConfigDecision.cause, "persistence or executable project configuration");
+		assert.equal(scopeEligible(gitConfigDecision, gitConfig, p), false);
+	});
+
+	test("a zshrc write is anchored without the leading dot", () => {
+		const d = describeBash("echo x >> ~/.zshrc", p.cwd, p.home);
+		const decision = decide(d, p);
+		assert.equal(decision.cause, "write outside the workspace");
+		assert.equal(scopeAnchor(decision, d, p, ["update my zshrc"]), true);
 	});
 });

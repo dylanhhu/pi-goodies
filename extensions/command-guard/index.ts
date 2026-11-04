@@ -9,8 +9,10 @@
  *     persistence, package installs, and destructive git, asks the human
  *   - a small floor is blocked outright
  *
- * There is no decision model, no approval memory, and no project config. The
- * global file is `~/.pi/agent/command-guard.json`; see README.md.
+ * An optional classifier model can tighten opaque code or suppress an ask
+ * when the task clearly requests the effect. There is no approval memory and no
+ * project config. The global file is `~/.pi/agent/command-guard.json`; see
+ * README.md.
  */
 
 import { realpathSync } from "node:fs";
@@ -19,6 +21,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createGuard } from "./guard.ts";
+import { type ClassifyFn, createModel, type GuardModel } from "./model.ts";
 import {
 	DEFAULT_MODE,
 	getMode,
@@ -28,12 +31,16 @@ import {
 	restoreMode,
 } from "./modes.ts";
 import { buildPolicy, loadConfigFile } from "./policy.ts";
+import { createTurnBuffer } from "./turn-buffer.ts";
 import { type Policy, TOOL_NAMES } from "./types.ts";
 
 /** Session entry type the guard records decisions under. */
 const AUDIT_ENTRY_TYPE = "command-guard";
 
 const STATUS_KEY = "command-guard";
+
+/** Set by the subagent extension: its only "user" message is another model's task. */
+const DELEGATED_ENV = "PI_GOODIES_SUBAGENT";
 
 /** The extension protects its own source, wherever it is installed. */
 function guardDirs(): string[] {
@@ -51,6 +58,8 @@ export default function (pi: ExtensionAPI) {
 	const home = process.env.HOME || homedir();
 	const globalPath = join(home, ".pi", "agent", "command-guard.json");
 	const protectedDirs = guardDirs();
+	const turnBuffer = createTurnBuffer();
+	const delegated = process.env[DELEGATED_ENV] === "1";
 
 	/** The permission mode of this session. Set by /permissions; never by config or the model */
 	let mode: PermissionMode = DEFAULT_MODE;
@@ -72,6 +81,25 @@ export default function (pi: ExtensionAPI) {
 			guardConfigPath: globalPath,
 		});
 		policy.warnings.unshift(...warnings);
+		if (policy.classifier) {
+			const [provider, ...rest] = policy.classifier.model.split("/");
+			const modelId = rest.join("/");
+			let available: unknown;
+			try {
+				available =
+					provider && modelId
+						? ctx.modelRegistry.findOfType("classifier", provider, modelId)
+						: undefined;
+			} catch {
+				available = undefined;
+			}
+			if (!available) {
+				policy.warnings.push(
+					`classifier model ${policy.classifier.model} is not available; static policy only`,
+				);
+				policy.classifier = undefined;
+			}
+		}
 
 		for (const warning of policy.warnings) {
 			if (ctx.hasUI) ctx.ui.notify(`command-guard: ${warning}`, "warning");
@@ -84,9 +112,26 @@ export default function (pi: ExtensionAPI) {
 	function guardFor(cwd: string, ctx: ExtensionContext) {
 		const cached = guards.get(cwd);
 		if (cached) return cached;
+		const policy = policyFor(cwd, ctx);
+		let model: GuardModel | undefined;
+		if (policy.classifier) {
+			const settings = policy.classifier;
+			const [provider, ...rest] = settings.model.split("/");
+			const modelId = rest.join("/");
+			const classify: ClassifyFn = async (context, signal) => {
+				const registry = ctx.modelRegistry;
+				const available = registry.findOfType("classifier", provider, modelId);
+				if (!available) throw new Error(`classifier model ${settings.model} is not available`);
+				return registry.classify(available, context, { signal });
+			};
+			model = createModel(classify, settings);
+		}
 		const guard = createGuard({
-			policy: policyFor(cwd, ctx),
+			policy,
 			audit: (entry) => pi.appendEntry(AUDIT_ENTRY_TYPE, entry),
+			model,
+			userMessages: () => turnBuffer.messages(),
+			delegated,
 		});
 		guards.set(cwd, guard);
 		return guard;
@@ -148,11 +193,15 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			const roots = policy.writeRoots.length > 0 ? policy.writeRoots.join(", ") : "none";
+			const classifier = policy.classifier
+				? `${policy.classifier.model} (opaque risk ${policy.classifier.opaqueRisk.enabled ? `${policy.classifier.opaqueRisk.ask}/${policy.classifier.opaqueRisk.block}` : "off"}, scope ${policy.classifier.scope.enabled ? policy.classifier.scope.threshold : "off"})`
+				: "off";
 			const lines = [
 				`Permission mode: ${mode.name}`,
 				`Workspace: ${policy.workspace}${policy.workspaceWritable ? "" : " (not writable)"}`,
 				`Write roots: ${roots}`,
 				`Fetch hosts: ${policy.fetchHosts.join(", ")}`,
+				`Classifier: ${classifier}`,
 				`Protected: ${policy.protectedDirs.join(", ")}`,
 				`Config: ${policy.guardConfigPath}`,
 			];
@@ -164,6 +213,7 @@ export default function (pi: ExtensionAPI) {
 		// A new session may have a different config on disk
 		policies.clear();
 		guards.clear();
+		turnBuffer.reset();
 		// Only a reload keeps the mode, since it re-runs this module in the same session.
 		// A resumed or forked session file is not trusted to switch the guard off, and
 		// without a UI nobody would see that it is off
@@ -173,6 +223,14 @@ export default function (pi: ExtensionAPI) {
 				: DEFAULT_MODE;
 		syncStatus(ctx);
 		if (mode.warning) ctx.ui.notify(`Permission mode restored: ${mode.warning}`, "warning");
+	});
+
+	pi.on("message_end", (event) => {
+		turnBuffer.onMessage(event.message);
+	});
+
+	pi.on("agent_end", () => {
+		turnBuffer.onAgentEnd();
 	});
 
 	pi.on("tool_call", async (event, ctx) => {

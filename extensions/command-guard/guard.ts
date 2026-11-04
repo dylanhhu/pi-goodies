@@ -5,7 +5,8 @@
  */
 
 import { describeToolCall } from "./descriptor.ts";
-import { decide } from "./policy.ts";
+import type { GuardModel } from "./model.ts";
+import { decide, scopeAnchor, scopeEligible } from "./policy.ts";
 import type { Decision, Descriptor, Policy } from "./types.ts";
 
 export interface AuditEntry {
@@ -23,8 +24,14 @@ export interface AuditEntry {
 
 export interface GuardDeps {
 	policy: Policy;
-	/** Receives an entry for every call that asked or was refused */
+	/** Receives an entry for every call that asked, was refused, or was suppressed by scope */
 	audit: (entry: AuditEntry) => void;
+	/** Optional classifier layer */
+	model?: GuardModel;
+	/** The user's messages for the current run */
+	userMessages?: () => string[];
+	/** This process was started by another model, so its messages are not the user's words */
+	delegated?: boolean;
 }
 
 export interface GuardToolCall {
@@ -96,6 +103,22 @@ function previewForDialog(text: string): string {
 }
 
 /** A sentence explaining why the effect matters, when the cause is not obvious. */
+const OPAQUE_RE =
+	/\b(?:bash|sh|zsh|dash|ksh|fish|python\d*|node|nodejs|deno|bun|perl|ruby|php|osascript|eval|exec|xargs|awk|gawk|mawk|nawk)\b|<<|`|\$\(/;
+
+/** Whether a static allow/ask should be shown to the opaque-code risk check. */
+function opaqueCandidate(d: Descriptor, decision: Decision): boolean {
+	if (d.tool !== "bash") return false;
+	if (
+		decision.source === "policy" &&
+		decision.cause === "mutation target could not be determined"
+	) {
+		return true;
+	}
+	if (decision.source !== "inspect") return false;
+	return OPAQUE_RE.test(d.command ?? "");
+}
+
 function explain(cause: string): string | undefined {
 	if (cause.startsWith("write outside"))
 		return "This is outside the project, so git cannot recover it.";
@@ -116,6 +139,11 @@ function explain(cause: string): string | undefined {
 		return "The host is not on the fetch list. Add it to fetchHosts to allow fetches.";
 	}
 	if (cause === "data upload") return "Data sent out cannot be recalled.";
+	if (cause === "opaque code risk") {
+		return "The code may have an effect that the shell text does not show.";
+	}
+	if (cause.startsWith("opaque code"))
+		return "The classifier could not confirm this code is harmless.";
 	if (cause === "elevated privileges") return "This runs with root privileges.";
 	if (cause === "package installation") return "This installs software outside the project.";
 	if (cause.startsWith("persistence")) return "This changes something that runs later.";
@@ -194,7 +222,59 @@ export function createGuard(deps: GuardDeps) {
 			};
 		}
 
-		const decision = decide(d, deps.policy);
+		let decision = decide(d, deps.policy);
+		let riskTightened = false;
+		if (deps.model && decision.outcome !== "block") {
+			if (opaqueCandidate(d, decision)) {
+				const risk = await deps.model.opaqueRisk({
+					descriptor: d,
+					decision,
+					signal: ctx.signal,
+				});
+				if (ctx.signal?.aborted) return ABORTED;
+				if (risk.outcome === "block" || (risk.outcome === "ask" && decision.outcome === "allow")) {
+					riskTightened = true;
+					decision = {
+						...decision,
+						outcome: risk.outcome,
+						source: "opaque-risk",
+						cause: risk.cause,
+						detail: risk.detail,
+					};
+				} else if (risk.outcome === "ask") {
+					riskTightened = true;
+				}
+			}
+
+			if (
+				decision.outcome === "ask" &&
+				!riskTightened &&
+				!deps.delegated &&
+				scopeEligible(decision, d, deps.policy)
+			) {
+				const messages = deps.userMessages?.() ?? [];
+				if (scopeAnchor(decision, d, deps.policy, messages)) {
+					const scope = await deps.model.scope({
+						descriptor: d,
+						decision,
+						userMessages: messages,
+						signal: ctx.signal,
+					});
+					if (ctx.signal?.aborted) return ABORTED;
+					if (scope.outcome === "allow") {
+						decision = {
+							outcome: "allow",
+							source: "scope",
+							cause: "authorized by the task",
+							detail: `${decision.cause}${decision.detail ? `: ${decision.detail}` : ""}`,
+							targets: decision.targets,
+							hosts: decision.hosts,
+						};
+					}
+				}
+			}
+		}
+
 		const entry: AuditEntry = {
 			tool: d.tool,
 			toolCallId: event.toolCallId,
@@ -206,7 +286,10 @@ export function createGuard(deps: GuardDeps) {
 			hosts: decision.hosts,
 		};
 
-		if (decision.outcome === "allow") return undefined;
+		if (decision.outcome === "allow") {
+			if (decision.source === "scope") audit(entry);
+			return undefined;
+		}
 
 		if (decision.outcome === "block") {
 			audit(entry);

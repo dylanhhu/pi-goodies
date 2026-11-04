@@ -5,12 +5,13 @@ import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import commandGuard from "../../extensions/command-guard/index.ts";
+import type { ClassifyContext, ClassifyResult } from "../../extensions/command-guard/model.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 interface Entry {
 	type: string;
 	customType?: string;
-	data: { tool: string; toolCallId: string; outcome: string };
+	data: { tool: string; toolCallId: string; outcome: string; source?: string };
 }
 interface RegisteredCommand {
 	description: string;
@@ -47,7 +48,18 @@ function writeProject(config: unknown) {
 	writeFileSync(join(project, ".pi", "command-guard.json"), JSON.stringify(config));
 }
 
-function load(opts: { hasUI?: boolean; branch?: unknown[] } = {}) {
+function load(
+	opts: {
+		hasUI?: boolean;
+		branch?: unknown[];
+		findOfType?: (type: string, provider: string, id: string) => unknown;
+		classify?: (
+			model: unknown,
+			context: ClassifyContext,
+			options?: { signal?: AbortSignal },
+		) => Promise<ClassifyResult>;
+	} = {},
+) {
 	const handlers = new Map<string, Handler>();
 	const commands = new Map<string, RegisteredCommand>();
 	const entries: Entry[] = [];
@@ -65,10 +77,23 @@ function load(opts: { hasUI?: boolean; branch?: unknown[] } = {}) {
 	const dialogs: string[] = [];
 	const notices: string[] = [];
 	const statuses: Array<string | undefined> = [];
+	const classified: ClassifyContext[] = [];
 	const ctx = {
 		cwd: project,
 		hasUI: opts.hasUI ?? true,
 		sessionManager: { getBranch: () => opts.branch ?? [] },
+		modelRegistry: {
+			findOfType: opts.findOfType ?? (() => ({ id: "classifier" })),
+			classify: async (model: unknown, context: ClassifyContext, o?: { signal?: AbortSignal }) => {
+				classified.push(context);
+				if (opts.classify) return opts.classify(model, context, o);
+				const answers: ClassifyResult["answers"] = {};
+				for (const key of Object.keys(context.questions)) {
+					answers[key] = { type: "bool", probability: 0 };
+				}
+				return { stopReason: "stop", answers };
+			},
+		},
 		ui: {
 			confirm: async (_title: string, message: string) => {
 				dialogs.push(message);
@@ -93,6 +118,7 @@ function load(opts: { hasUI?: boolean; branch?: unknown[] } = {}) {
 		dialogs,
 		notices,
 		statuses,
+		classified,
 		ctx,
 		toolCall,
 		permissions,
@@ -309,5 +335,94 @@ describe("hardening", () => {
 		const { toolCall, notices } = load();
 		assert.equal(await toolCall("bash", { command: "ls" }), undefined);
 		assert.ok(notices.some((n) => /config must be a JSON object/.test(n)));
+	});
+});
+
+describe("decision model wiring", () => {
+	const config = { classifier: { model: "provider/model", timeoutMs: 1000 } };
+
+	test("an opaque allow is escalated by the risk check", async () => {
+		writeGlobal(config);
+		const { toolCall, classified, dialogs } = load({
+			classify: async (_model, context) => {
+				const answers: ClassifyResult["answers"] = {};
+				for (const key of Object.keys(context.questions)) {
+					answers[key] = { type: "bool", probability: key === "hiddenWrite" ? 0.8 : 0 };
+				}
+				return { stopReason: "stop", answers };
+			},
+		});
+		const r = await toolCall("bash", { command: "python3 - <<'PY'\nprint(1)\nPY" });
+		assert.equal(r?.block, true);
+		assert.equal(classified.length, 1);
+		assert.ok(classified[0].questions.hiddenWrite);
+		assert.ok(!JSON.stringify(classified[0].state).includes("userMessages"));
+		assert.equal(dialogs.length, 1);
+	});
+
+	test("a scope answer suppresses an otherwise asked write", async () => {
+		writeGlobal(config);
+		const { handlers, ctx, toolCall, dialogs, entries, classified } = load({
+			classify: async (_model, context) => {
+				const answers: ClassifyResult["answers"] = {};
+				for (const key of Object.keys(context.questions)) {
+					answers[key] = { type: "bool", probability: key === "authorized" ? 0.9 : 0 };
+				}
+				return { stopReason: "stop", answers };
+			},
+		});
+		handlers.get("session_start")?.({ reason: "startup" }, ctx);
+		handlers.get("message_end")?.(
+			{ message: { role: "user", content: "create a kicad skill" } },
+			ctx,
+		);
+		const r = await toolCall("write", {
+			path: join(home, ".agents", "skills", "kicad", "SKILL.md"),
+			content: "x",
+		});
+		assert.equal(r, undefined);
+		assert.equal(dialogs.length, 0);
+		assert.equal(classified.length, 1);
+		assert.ok(JSON.stringify(classified[0].state).includes("create a kicad skill"));
+		assert.equal(entries.at(-1)?.data.source, "scope");
+	});
+
+	test("a missing classifier disables the model and keeps the static policy", async () => {
+		writeGlobal(config);
+		const { toolCall, notices, classified } = load({ findOfType: () => undefined });
+		assert.equal(await toolCall("bash", { command: "ls" }), undefined);
+		assert.equal(classified.length, 0);
+		assert.ok(notices.some((n) => /classifier model provider\/model is not available/.test(n)));
+	});
+
+	test("yolo does not call the classifier", async () => {
+		writeGlobal(config);
+		const { toolCall, permissions, classified, dialogs } = load();
+		await permissions("yolo");
+		assert.equal(await toolCall("bash", { command: "python3 - <<'PY'\nprint(1)\nPY" }), undefined);
+		assert.equal(classified.length, 0);
+		assert.equal(dialogs.length, 0);
+	});
+
+	test("a subagent does not send its task text to the scope check", async () => {
+		writeGlobal(config);
+		process.env.PI_GOODIES_SUBAGENT = "1";
+		try {
+			const { handlers, ctx, toolCall, classified, dialogs } = load();
+			handlers.get("session_start")?.({ reason: "startup" }, ctx);
+			handlers.get("message_end")?.(
+				{ message: { role: "user", content: "create a kicad skill" } },
+				ctx,
+			);
+			const r = await toolCall("write", {
+				path: join(home, ".agents", "skills", "kicad", "SKILL.md"),
+				content: "x",
+			});
+			assert.equal(r?.block, true);
+			assert.equal(dialogs.length, 1);
+			assert.equal(classified.length, 0);
+		} finally {
+			delete process.env.PI_GOODIES_SUBAGENT;
+		}
 	});
 });

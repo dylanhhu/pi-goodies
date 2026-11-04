@@ -34,12 +34,21 @@ export interface Descriptor {
 
 /**
  * One decision. `source` says which part of the policy answered, for the audit
- * entry and for the dialog. There is no model and no remembered approval: the
- * same input and config always produce the same decision.
+ * entry and for the dialog. The static decision is deterministic; the optional
+ * model can only tighten an allow or suppress an ask, never touch a block.
  */
 export interface Decision {
 	outcome: Outcome;
-	source: "readonly" | "inspect" | "path" | "fetch-host" | "local-network" | "floor" | "policy";
+	source:
+		| "readonly"
+		| "inspect"
+		| "path"
+		| "fetch-host"
+		| "local-network"
+		| "floor"
+		| "policy"
+		| "opaque-risk"
+		| "scope";
 	/** Short cause, shown as the dialog title and in refusal reasons */
 	cause: string;
 	/** The path, host, or other detail behind the cause */
@@ -62,6 +71,52 @@ export interface GuardConfig {
 	allowRemoteShell?: boolean;
 	/** Allow the read tool to open sensitive files */
 	allowReadSecrets?: boolean;
+	/** Optional classifier model; see model.ts */
+	classifier?: ClassifierSettings;
+}
+
+export interface OpaqueRiskSettings {
+	/** Default true when a classifier model is configured */
+	enabled?: boolean;
+	/** Probability at which an opaque effect becomes an ask */
+	ask?: number;
+	/** Probability at which an opaque effect becomes a block */
+	block?: number;
+	/** What to do when the classifier fails: keep the static decision, ask, or block */
+	onError?: "keep" | "ask" | "block";
+}
+
+export interface ScopeSettings {
+	/** Default true when a classifier model is configured */
+	enabled?: boolean;
+	/** Probability at which an ask is suppressed because the task clearly requests it */
+	threshold?: number;
+	/** What to do when the classifier fails: ask, or allow the suppression */
+	onError?: "ask" | "allow";
+}
+
+export interface ClassifierSettings {
+	/** `<provider>/<model-id>` of a classifier model */
+	model?: string;
+	timeoutMs?: number;
+	opaqueRisk?: OpaqueRiskSettings;
+	scope?: ScopeSettings;
+}
+
+export interface ResolvedClassifier {
+	model: string;
+	timeoutMs: number;
+	opaqueRisk: {
+		enabled: boolean;
+		ask: number;
+		block: number;
+		onError: "keep" | "ask" | "block";
+	};
+	scope: {
+		enabled: boolean;
+		threshold: number;
+		onError: "ask" | "allow";
+	};
 }
 
 /** Config plus the resolved roots for one working directory. */
@@ -81,5 +136,6 @@ export interface Policy {
 	allowReadSecrets: boolean;
 	protectedDirs: string[];
 	guardConfigPath: string;
+	classifier?: ResolvedClassifier;
 	warnings: string[];
 }

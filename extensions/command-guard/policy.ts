@@ -4,7 +4,9 @@
  * The policy is stateless: one tool call, one decision. It has three answers
  * (allow, ask, block) and they come from the effect classifier, the paths and
  * hosts the call touches, and a small floor of things that are never allowed.
- * There is no decision model, no approval memory, and no project config.
+ * An optional classifier model can tighten an allow (opaque code) or suppress
+ * an ask (scope), but the static policy remains authoritative. There is no
+ * approval memory and no project config.
  */
 
 import { existsSync, readFileSync, statSync } from "node:fs";
@@ -20,7 +22,16 @@ import {
 } from "./extract.ts";
 import { floorHit, sendsData } from "./floor.ts";
 import { isSensitivePath, realResolve, resolvePathArg } from "./paths.ts";
-import type { Decision, Descriptor, GuardConfig, Policy } from "./types.ts";
+import type {
+	ClassifierSettings,
+	Decision,
+	Descriptor,
+	GuardConfig,
+	OpaqueRiskSettings,
+	Policy,
+	ResolvedClassifier,
+	ScopeSettings,
+} from "./types.ts";
 
 const DEFAULT_FETCH_HOSTS = [
 	"github.com",
@@ -53,6 +64,27 @@ const DEFAULT_FETCH_HOSTS = [
 const SCRATCH_ROOTS = ["/tmp", "/private/tmp", "/var/tmp", "~/.cache", "~/Library/Caches"];
 /** Moves here are recoverable, so they are not external writes */
 const TRASH_ROOTS = ["~/.Trash"];
+/** The user's worktrees live here; creating one must not require a prompt. */
+const DEFAULT_WRITE_ROOTS = ["~/.worktrees"];
+/** Generated dependency and build directories are disposable wherever they appear. */
+const DISPOSABLE_SEGMENTS = new Set([
+	"node_modules",
+	"dist",
+	"build",
+	"target",
+	"out",
+	"coverage",
+	".next",
+	".nuxt",
+	".cache",
+	".venv",
+	"venv",
+	"__pycache__",
+	".pytest_cache",
+	".mypy_cache",
+	".ruff_cache",
+	"DerivedData",
+]);
 
 // ---------------------------------------------------------------------------
 // Config
@@ -66,6 +98,125 @@ function isStringArray(value: unknown): value is string[] {
 	return Array.isArray(value) && value.every((v) => typeof v === "string");
 }
 
+function isProbability(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
+function parseOpaqueRisk(raw: unknown, warnings: string[]): OpaqueRiskSettings | undefined {
+	if (!isRecord(raw)) {
+		warnings.push("classifier.opaqueRisk must be an object; ignored");
+		return undefined;
+	}
+	const out: OpaqueRiskSettings = {};
+	for (const key of Object.keys(raw)) {
+		if (!["enabled", "ask", "block", "onError"].includes(key)) {
+			warnings.push(`unknown classifier.opaqueRisk field "${key}"`);
+		}
+	}
+	if (raw.enabled !== undefined) {
+		if (typeof raw.enabled === "boolean") out.enabled = raw.enabled;
+		else warnings.push("classifier.opaqueRisk.enabled must be a boolean; ignored");
+	}
+	for (const key of ["ask", "block"] as const) {
+		if (raw[key] === undefined) continue;
+		if (isProbability(raw[key])) out[key] = raw[key];
+		else warnings.push(`classifier.opaqueRisk.${key} must be between 0 and 1; ignored`);
+	}
+	if (raw.onError !== undefined) {
+		if (raw.onError === "keep" || raw.onError === "ask" || raw.onError === "block") {
+			out.onError = raw.onError;
+		} else {
+			warnings.push("classifier.opaqueRisk.onError must be keep, ask, or block; ignored");
+		}
+	}
+	return out;
+}
+
+function parseScope(raw: unknown, warnings: string[]): ScopeSettings | undefined {
+	if (!isRecord(raw)) {
+		warnings.push("classifier.scope must be an object; ignored");
+		return undefined;
+	}
+	const out: ScopeSettings = {};
+	for (const key of Object.keys(raw)) {
+		if (!["enabled", "threshold", "onError"].includes(key)) {
+			warnings.push(`unknown classifier.scope field "${key}"`);
+		}
+	}
+	if (raw.enabled !== undefined) {
+		if (typeof raw.enabled === "boolean") out.enabled = raw.enabled;
+		else warnings.push("classifier.scope.enabled must be a boolean; ignored");
+	}
+	if (raw.threshold !== undefined) {
+		if (isProbability(raw.threshold)) out.threshold = raw.threshold;
+		else warnings.push("classifier.scope.threshold must be between 0 and 1; ignored");
+	}
+	if (raw.onError !== undefined) {
+		if (raw.onError === "ask" || raw.onError === "allow") out.onError = raw.onError;
+		else warnings.push("classifier.scope.onError must be ask or allow; ignored");
+	}
+	return out;
+}
+
+function parseClassifier(raw: unknown, warnings: string[]): ClassifierSettings | undefined {
+	if (!isRecord(raw)) {
+		warnings.push("classifier must be an object; ignored");
+		return undefined;
+	}
+	for (const key of Object.keys(raw)) {
+		if (!["model", "timeoutMs", "opaqueRisk", "scope"].includes(key)) {
+			warnings.push(`unknown classifier field "${key}"`);
+		}
+	}
+	if (typeof raw.model !== "string" || raw.model.trim() === "") {
+		warnings.push("classifier.model must be a provider/model string; classifier disabled");
+		return undefined;
+	}
+	const out: ClassifierSettings = { model: raw.model.trim() };
+	if (raw.timeoutMs !== undefined) {
+		if (typeof raw.timeoutMs === "number" && Number.isFinite(raw.timeoutMs) && raw.timeoutMs > 0) {
+			out.timeoutMs = raw.timeoutMs;
+		} else {
+			warnings.push("classifier.timeoutMs must be a positive number; ignored");
+		}
+	}
+	if (raw.opaqueRisk !== undefined) {
+		const opaqueRisk = parseOpaqueRisk(raw.opaqueRisk, warnings);
+		if (opaqueRisk) out.opaqueRisk = opaqueRisk;
+	}
+	if (raw.scope !== undefined) {
+		const scope = parseScope(raw.scope, warnings);
+		if (scope) out.scope = scope;
+	}
+	return out;
+}
+
+function resolveClassifier(settings: ClassifierSettings, warnings: string[]): ResolvedClassifier {
+	const opaque = settings.opaqueRisk ?? {};
+	const scope = settings.scope ?? {};
+	const resolved: ResolvedClassifier = {
+		model: settings.model ?? "",
+		timeoutMs: settings.timeoutMs ?? 5_000,
+		opaqueRisk: {
+			enabled: opaque.enabled ?? true,
+			ask: opaque.ask ?? 0.6,
+			block: opaque.block ?? 0.92,
+			onError: opaque.onError ?? "keep",
+		},
+		scope: {
+			enabled: scope.enabled ?? true,
+			threshold: scope.threshold ?? 0.65,
+			onError: scope.onError ?? "ask",
+		},
+	};
+	if (resolved.opaqueRisk.ask >= resolved.opaqueRisk.block) {
+		warnings.push("classifier.opaqueRisk.ask must be below block; using the defaults 0.6 and 0.92");
+		resolved.opaqueRisk.ask = 0.6;
+		resolved.opaqueRisk.block = 0.92;
+	}
+	return resolved;
+}
+
 const CONFIG_FIELDS = new Set([
 	"writeRoots",
 	"fetchHosts",
@@ -73,6 +224,7 @@ const CONFIG_FIELDS = new Set([
 	"allowPackageInstall",
 	"allowRemoteShell",
 	"allowReadSecrets",
+	"classifier",
 ]);
 
 export function parseConfig(raw: unknown, warnings: string[]): GuardConfig {
@@ -98,6 +250,10 @@ export function parseConfig(raw: unknown, warnings: string[]): GuardConfig {
 		if (raw[key] === undefined) continue;
 		if (typeof raw[key] === "boolean") config[key] = raw[key];
 		else warnings.push(`${key} must be a boolean; ignored`);
+	}
+	if (raw.classifier !== undefined) {
+		const classifier = parseClassifier(raw.classifier, warnings);
+		if (classifier) config.classifier = classifier;
 	}
 	return config;
 }
@@ -179,7 +335,13 @@ export function buildPolicy(input: BuildPolicyInput): Policy {
 	const config = input.config ?? {};
 	const warnings: string[] = [];
 	const workspace = findWorkspace(cwd, home);
-	const writeRoots = resolveRoots(config.writeRoots, cwd, home, "writeRoots", warnings);
+	const writeRoots = resolveRoots(
+		[...DEFAULT_WRITE_ROOTS, ...(config.writeRoots ?? [])],
+		cwd,
+		home,
+		"writeRoots",
+		warnings,
+	);
 	const scratchRoots = [...SCRATCH_ROOTS, ...TRASH_ROOTS].flatMap((root) => {
 		const abs = resolvePathArg(root, cwd, home);
 		return abs === undefined ? [] : [realResolve(abs)];
@@ -188,6 +350,7 @@ export function buildPolicy(input: BuildPolicyInput): Policy {
 		.map(normalizeHost)
 		.filter(Boolean);
 	const protectedDirs = (input.protectedDirs ?? []).map((dir) => realResolve(dir));
+	const classifier = config.classifier ? resolveClassifier(config.classifier, warnings) : undefined;
 
 	return {
 		cwd: resolve(cwd),
@@ -203,6 +366,7 @@ export function buildPolicy(input: BuildPolicyInput): Policy {
 		allowReadSecrets: config.allowReadSecrets ?? false,
 		protectedDirs,
 		guardConfigPath: input.guardConfigPath ?? join(home, ".pi", "agent", "command-guard.json"),
+		classifier,
 		warnings,
 	};
 }
@@ -229,7 +393,8 @@ function isProtected(path: string, policy: Policy): boolean {
 	return underAny(path, policy.protectedDirs);
 }
 
-const gitRoots = new Map<string, boolean>();
+/** Only confirmed roots are cached: a worktree can be created after a negative check. */
+const gitRoots = new Set<string>();
 
 /** True when the path is inside a git working tree, where git is the recovery path. */
 function isGitWorktree(path: string): boolean {
@@ -241,22 +406,14 @@ function isGitWorktree(path: string): boolean {
 	}
 	const seen: string[] = [];
 	for (;;) {
-		const cached = gitRoots.get(dir);
-		if (cached !== undefined) {
-			for (const part of seen) gitRoots.set(part, cached);
-			return cached;
-		}
+		if (gitRoots.has(dir)) return true;
 		if (existsSync(join(dir, ".git"))) {
-			for (const part of seen) gitRoots.set(part, true);
-			gitRoots.set(dir, true);
+			for (const part of seen) gitRoots.add(part);
+			gitRoots.add(dir);
 			return true;
 		}
 		const parent = dirname(dir);
-		if (parent === dir) {
-			for (const part of seen) gitRoots.set(part, false);
-			gitRoots.set(dir, false);
-			return false;
-		}
+		if (parent === dir) return false;
 		seen.push(dir);
 		dir = parent;
 	}
@@ -286,6 +443,13 @@ function isPersistencePath(path: string): boolean {
 	);
 }
 
+/** Generated dependency and build output, which can be recreated. */
+function isDisposablePath(path: string): boolean {
+	return resolve(path)
+		.split(sep)
+		.some((part) => DISPOSABLE_SEGMENTS.has(part));
+}
+
 function pathDecision(rawPath: string, policy: Policy): Decision {
 	// A symlink must not stand in for a protected or sensitive target
 	const path = realResolve(rawPath);
@@ -302,6 +466,9 @@ function pathDecision(rawPath: string, policy: Policy): Decision {
 			cause: "persistence or executable project configuration",
 			detail: path,
 		};
+	}
+	if (isDisposablePath(path)) {
+		return { outcome: "allow", source: "path", cause: "disposable build output", detail: path };
 	}
 	if (policy.workspaceWritable && isUnder(path, policy.workspace)) {
 		return { outcome: "allow", source: "path", cause: "workspace write", detail: path };
@@ -647,6 +814,196 @@ const EMPTY_TARGET_MUTATORS = new Set([
 	"dd",
 	"tee",
 ]);
+
+// ---------------------------------------------------------------------------
+// Scope check eligibility
+// ---------------------------------------------------------------------------
+
+const SCOPE_CAUSES = new Set([
+	"write outside the workspace",
+	"pi config or instructions",
+	"network access to a host not on the fetch list",
+	"package installation",
+	"push to a remote",
+	"docker state change",
+	"docker compose state change",
+	"GitHub state change",
+	"API write",
+	"process signal",
+	"persistence or executable project configuration",
+	"git clean deletes untracked files",
+	"git reset --hard discards uncommitted work",
+	"git checkout discards uncommitted work",
+	"git restore discards uncommitted work",
+	"git stash drop or clear removes saved work",
+	"git branch deletion",
+	"git tag deletion",
+]);
+
+const SCOPE_WORD_HINTS: Record<string, string[]> = {
+	"push to a remote": ["push"],
+	"docker state change": ["docker"],
+	"docker compose state change": ["docker", "compose"],
+	"GitHub state change": [
+		"pr",
+		"pull request",
+		"issue",
+		"review",
+		"release",
+		"github",
+		"merge",
+		"comment",
+	],
+	"API write": ["api", "github", "post", "update"],
+	"process signal": ["kill", "stop", "restart", "reload", "process", "server", "service"],
+	"git clean deletes untracked files": ["clean", "discard", "untracked", "remove"],
+	"git reset --hard discards uncommitted work": ["reset", "hard", "discard", "revert"],
+	"git checkout discards uncommitted work": ["checkout", "discard", "restore", "revert"],
+	"git restore discards uncommitted work": ["restore", "discard", "revert"],
+	"git stash drop or clear removes saved work": ["stash", "drop", "clear"],
+	"git branch deletion": ["branch", "delete", "remove"],
+	"git tag deletion": ["tag", "delete", "remove"],
+	"persistence or executable project configuration": [
+		"ci",
+		"workflow",
+		"hook",
+		"vscode",
+		"task",
+		"envrc",
+		"pre-commit",
+		"pipeline",
+	],
+};
+
+const PATH_STOP_WORDS = new Set([
+	"users",
+	"home",
+	"documents",
+	"git",
+	"src",
+	"index",
+	"main",
+	"test",
+	"tests",
+	"file",
+	"files",
+	"lib",
+	"tmp",
+	"private",
+	"var",
+	"worktrees",
+	"projects",
+	"code",
+	"repos",
+	"repo",
+]);
+
+function escapeRegExp(text: string): string {
+	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function matchesToken(text: string, token: string): boolean {
+	if (token.length < 3) return new RegExp(`\\b${escapeRegExp(token)}\\b`).test(text);
+	return text.includes(token) || (token.endsWith("s") && text.includes(token.slice(0, -1)));
+}
+
+function pathTokens(path: string, policy: Policy): string[] {
+	const homeParts = new Set(
+		resolve(policy.home)
+			.split(sep)
+			.filter(Boolean)
+			.map((part) => part.toLowerCase()),
+	);
+	const tokens: string[] = [];
+	for (const part of resolve(path).split(sep).slice(-4)) {
+		const lower = part.toLowerCase();
+		if (!lower || homeParts.has(lower) || PATH_STOP_WORDS.has(lower)) continue;
+		const pieces = [lower];
+		if (lower.includes(".")) pieces.push(lower.slice(0, lower.indexOf(".")));
+		const withoutDot = lower.replace(/^\.+/, "");
+		if (withoutDot && withoutDot !== lower) pieces.push(withoutDot);
+		for (const piece of lower.split(/[-_.]/)) if (piece) pieces.push(piece);
+		for (const piece of pieces) {
+			if (piece.length >= 2 && !PATH_STOP_WORDS.has(piece)) tokens.push(piece);
+		}
+	}
+	return [...new Set(tokens)];
+}
+
+function packageTokens(command: string): string[] {
+	const tokens: string[] = [];
+	for (const words of commandSegments(command)) {
+		const [name, ...args] = commandWords(words);
+		if (!name || !PACKAGE_MANAGERS.has(name)) continue;
+		const action = firstAction(args);
+		if (!action) continue;
+		const start = args.indexOf(action) + 1;
+		for (const arg of args.slice(start)) {
+			if (arg.startsWith("-")) continue;
+			const normalized = arg
+				.toLowerCase()
+				.replace(/^@/, "")
+				.replace(/@[^/]*$/, "")
+				.replace(/^.*\//, "");
+			if (normalized) tokens.push(normalized);
+		}
+	}
+	return [...new Set(tokens)];
+}
+
+/** Whether an ask is the kind a task can explicitly authorize. */
+export function scopeEligible(decision: Decision, _d: Descriptor, policy: Policy): boolean {
+	if (decision.outcome !== "ask" || !SCOPE_CAUSES.has(decision.cause)) return false;
+	if (decision.cause === "pi config or instructions") {
+		return decision.detail ? underAny(decision.detail, [join(policy.home, ".agents")]) : false;
+	}
+	if (decision.cause === "persistence or executable project configuration") {
+		if (!decision.detail) return false;
+		// Git metadata can change how every later git command runs
+		return !decision.detail.includes("/.git/") && !decision.detail.endsWith("/.git");
+	}
+	return true;
+}
+
+/**
+ * A deterministic anchor before the model sees an ask. The path, host, package,
+ * or operation must appear in the user's words; a broad "do whatever it takes"
+ * is not enough to suppress an outside effect.
+ */
+export function scopeAnchor(
+	decision: Decision,
+	descriptor: Descriptor,
+	policy: Policy,
+	userMessages: string[],
+): boolean {
+	const text = userMessages.join("\n").toLowerCase();
+	if (!text.trim()) return false;
+
+	if (decision.cause === "network access to a host not on the fetch list") {
+		const hosts = (decision.detail ?? "").split(/,\s*/).filter(Boolean);
+		return hosts.some((host) => {
+			const labels = normalizeHost(host).split(".");
+			const tail = labels.slice(-2).join(".");
+			return matchesToken(text, host.toLowerCase()) || (tail && matchesToken(text, tail));
+		});
+	}
+
+	if (decision.cause === "package installation") {
+		if (
+			/\b(?:install|add|update|upgrade|remove|uninstall|dependenc(?:y|ies)|packages?)\b/.test(text)
+		) {
+			return true;
+		}
+		return packageTokens(descriptor.command ?? "").some((token) => matchesToken(text, token));
+	}
+
+	if (decision.detail?.startsWith("/")) {
+		return pathTokens(decision.detail, policy).some((token) => matchesToken(text, token));
+	}
+
+	const hints = SCOPE_WORD_HINTS[decision.cause] ?? [];
+	return hints.some((hint) => matchesToken(text, hint));
+}
 
 // ---------------------------------------------------------------------------
 // Decisions
