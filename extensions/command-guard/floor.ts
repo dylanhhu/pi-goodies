@@ -24,6 +24,11 @@ const DISK_DD = new RegExp(
 );
 const DISK_REDIRECT = />\s*\/dev\/(?:sd|nvme|disk|hd|mmcblk|rdisk)\w*/i;
 
+const SECURE_ERASE = new RegExp(
+	String.raw`${CMD}(?:shred|srm)\b|\brm\b[^;&|\n]*\s-[a-zA-Z]*P\b`,
+	"i",
+);
+
 const REVERSE_SOCKET = /\/dev\/(?:tcp|udp)\/(?!127\.|localhost\b|::1)/i;
 const NC_EXEC = new RegExp(String.raw`${CMD}(?:nc|ncat|netcat)\s[^;&|\n]*\s-[a-zA-Z]*e\b`, "i");
 const BASH_INTERACTIVE = new RegExp(String.raw`${CMD}(?:ba|z|da|k)?sh\s+-i\s+>&`, "i");
@@ -76,6 +81,7 @@ export function floorHit(command: string): string | undefined {
 	if (REVERSE_SOCKET.test(text) || NC_EXEC.test(text) || BASH_INTERACTIVE.test(text)) {
 		return "reverse shell or raw socket";
 	}
+	if (SECURE_ERASE.test(text)) return "secure erase";
 	if (RM_ROOT.test(text)) return "recursive delete of root or home";
 	if (REMOTE_TO_SHELL.test(text)) return "remote script piped into a shell";
 	if (CHMOD_ROOT.test(text)) return "recursive permission opening on root or home";

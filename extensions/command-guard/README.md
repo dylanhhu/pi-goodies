@@ -21,28 +21,28 @@ flowchart TD
 
 ## Policy
 
-| Effect                                                                                                               | Default        |
-| -------------------------------------------------------------------------------------------------------------------- | -------------- |
-| Read of a non-sensitive path                                                                                         | allow          |
-| Read of a credential, key, or secret                                                                                 | ask            |
-| Write or edit in the workspace                                                                                       | allow          |
-| Write or edit in scratch (`/tmp`, caches, `~/.Trash`)                                                                | allow          |
-| Write or edit in a git worktree                                                                                      | allow          |
-| Write or edit in a configured `writeRoots` entry                                                                     | allow          |
-| Write or edit outside those                                                                                          | ask            |
-| Delete inside the workspace, scratch, or a git worktree                                                              | allow          |
-| Delete outside those                                                                                                 | ask            |
-| Fetch from a configured host                                                                                         | allow          |
-| Fetch from a new host                                                                                                | ask            |
-| Upload data or use a non-GET request                                                                                 | ask            |
-| Local and private-network access                                                                                     | allow          |
-| `sudo`, `doas`, `su`                                                                                                 | ask every time |
-| Package installs, services, cron, launchd, shell rc, git hooks                                                       | ask            |
-| `git push` (force push always), `git clean`, `git reset --hard`, `git restore`                                       | ask            |
-| Docker state changes, remote shells and transfers                                                                    | ask            |
-| Process signals                                                                                                      | ask            |
-| Disk devices, reverse shells, `rm -rf /` or `~`, remote scripts piped to a shell, sensitive data sent to the network | block          |
-| command-guard's source, its config, and `~/.pi/agent/auth.json`                                                      | block          |
+| Effect                                                                                                                             | Default        |
+| ---------------------------------------------------------------------------------------------------------------------------------- | -------------- |
+| Read of a non-sensitive path                                                                                                       | allow          |
+| Read of a credential, key, or secret                                                                                               | ask            |
+| Write or edit in the workspace                                                                                                     | allow          |
+| Write or edit in scratch (`/tmp`, caches, `~/.Trash`)                                                                              | allow          |
+| Write or edit in a git worktree                                                                                                    | allow          |
+| Write or edit in a configured `writeRoots` entry                                                                                   | allow          |
+| Write or edit outside those                                                                                                        | ask            |
+| Delete inside the workspace, scratch, or a git worktree                                                                            | allow          |
+| Delete outside those                                                                                                               | ask            |
+| Fetch from a configured host                                                                                                       | allow          |
+| Fetch from a new host                                                                                                              | ask            |
+| Upload data or use a non-GET request                                                                                               | ask            |
+| Local and private-network access                                                                                                   | allow          |
+| `sudo`, `doas`, `su`                                                                                                               | ask every time |
+| Package installs, services, cron, launchd, shell rc, git hooks                                                                     | ask            |
+| `git push` (force push always), `git clean`, `git reset --hard`, `git restore`                                                     | ask            |
+| Docker state changes, remote shells and transfers                                                                                  | ask            |
+| Process signals                                                                                                                    | ask            |
+| Disk devices, secure erase, reverse shells, `rm -rf /` or `~`, remote scripts piped to a shell, sensitive data sent to the network | block          |
+| command-guard's source, its config, and `~/.pi/agent/auth.json`                                                                    | block          |
 
 The workspace is the git root containing the session's working directory, or the working directory when it is not in a repository. A session started in the home directory or at `/` does not make that whole tree writable; writes there ask unless they land in scratch, a configured root, or a git worktree. Any path inside any git worktree is treated as recoverable, which covers sibling checkouts and `~/.worktrees`.
 
@@ -70,6 +70,15 @@ Common additions:
 - `"writeRoots": ["~/.agents"]` if you routinely ask the agent to create or edit skills
 - `"fetchHosts": ["openrouter.ai"]` is already a default; add any private API host you use
 - `"allowGitPush": true` if you want the agent to push without a prompt
+
+## Migrating from the old config
+
+The old `profile`, `judge`, `rules`, `allowlist`, `overrides`, `limits`, and `display` keys are no longer read. Each one is reported as an unknown field and ignored; replace the file with the keys above. The behavior changes are deliberate:
+
+- `rm -f` is no longer confirmed everywhere. Deletes inside the workspace, scratch, or a git worktree run; deletes outside ask
+- `chmod` and `chown` are path-checked, not confirmed by pattern
+- `shred` and `rm -P` are blocked by the floor
+- the old `protect-pi-config` override is now the guard's self-protection: its config is blocked, so edit it yourself or use `/permissions yolo`
 
 ## Commands
 
