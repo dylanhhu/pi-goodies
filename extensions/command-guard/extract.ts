@@ -1,8 +1,8 @@
 /**
  * Heuristic extraction of network hosts and file mutation targets from a bash
- * command string. This is deliberately not a shell parser: it feeds Layer 1
- * tripwires, and anything it misses (variables, obfuscation, interpreters)
- * is left to the decision model.
+ * command string. This is deliberately not a shell parser: it feeds the effect
+ * policy, and anything it misses (variables, obfuscation, interpreters) is
+ * treated as opaque rather than proven safe.
  */
 
 import { basename } from "node:path";
@@ -38,7 +38,14 @@ interface PendingHeredoc {
 	quoted: boolean;
 	/** The heredoc's consumer only writes or displays it */
 	feedsData: boolean;
+	/** The body is run by a shell (or eval), rather than read as data or interpreted as another language */
+	shell: boolean;
 }
+
+/** The consumer of an executed heredoc: a shell, eval, or a pipeline into one. */
+const SHELL_CONSUMER =
+	/(?:^|[;&|(\s])(?:sudo\s+(?:-\S+\s+)*)?(?:ba|z|da|k)?sh\b|(?:^|[;&|(\s])eval\b/;
+const SHELL_PIPE = /\|\s*(?:sudo\s+(?:-\S+\s+)*)?(?:ba|z|da|k)?sh\b/;
 
 /**
  * Remove heredoc bodies that are plain data, so file contents being written do
@@ -55,7 +62,7 @@ interface PendingHeredoc {
  * recognized outside quotes and comments, since `cat "<<EOF"` or `# <<EOF` open
  * no heredoc and the lines that follow do execute.
  */
-export function stripInertHeredocs(command: string): string {
+export function stripInertHeredocs(command: string, dropInterpreted = false): string {
 	if (!command.includes("<<")) return command;
 	const n = command.length;
 	const stack: Frame[] = [{ kind: "code", cmdStart: 0 }];
@@ -97,7 +104,8 @@ export function stripInertHeredocs(command: string): string {
 				end = eol === -1 ? n : eol + 1;
 			}
 			const body = command.slice(bodyStart, end);
-			if (h.feedsData && (h.quoted || !/\$\(|`/.test(body))) {
+			const inert = h.feedsData && (h.quoted || !/\$\(|`/.test(body));
+			if (inert || (dropInterpreted && !h.shell)) {
 				// Without a trailing newline, take the one before the body too
 				const from = termEnd === n && bodyStart > 0 ? bodyStart - 1 : bodyStart;
 				removed.push([from, termEnd]);
@@ -185,20 +193,24 @@ export function stripInertHeredocs(command: string): string {
 			const [text, dash, escaped, quote, delimiter] = m;
 			const consumer = command.slice(frame.cmdStart, i);
 			let feedsData: boolean;
+			let shell: boolean;
 			if (frame.outer !== undefined) {
 				// Inside a substitution the consumer of the output is the enclosing command
 				feedsData = DATA_CONSUMER.test(consumer) && TEXT_SINK.test(frame.outer);
+				shell = SHELL_CONSUMER.test(frame.outer);
 			} else {
 				const eol = command.indexOf("\n", i + text.length);
 				const rest = command.slice(i + text.length, eol === -1 ? n : eol);
 				feedsData =
 					(DATA_CONSUMER.test(consumer) || TEXT_SINK.test(consumer)) && !rest.includes("|");
+				shell = SHELL_CONSUMER.test(consumer) || SHELL_PIPE.test(rest);
 			}
 			pending.push({
 				dash: dash === "-",
 				delimiter,
 				quoted: escaped === "\\" || quote !== "",
 				feedsData,
+				shell,
 			});
 			i += text.length;
 		} else {
@@ -214,6 +226,15 @@ export function stripInertHeredocs(command: string): string {
 		from = end;
 	}
 	return out + command.slice(from);
+}
+
+/**
+ * The command with heredoc bodies removed unless a shell will execute them.
+ * Python, Node, and other interpreter bodies are code, not shell commands, so
+ * scanning them as shell text produces false positives on strings and comments.
+ */
+export function shellScanText(command: string): string {
+	return stripInertHeredocs(command, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -353,7 +374,7 @@ const WRAPPERS = new Map<string, WrapperSpec>([
 ]);
 
 /** Strip leading env assignments and wrapper commands; returns [commandName, ...args]. */
-function commandWords(words: string[]): string[] {
+export function commandWords(words: string[]): string[] {
 	const rest = [...words];
 	for (;;) {
 		if (rest.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(rest[0])) {
@@ -385,7 +406,7 @@ const MAX_NESTING = 3;
  * They are command text like any other, so hosts and write targets inside them
  * are extracted too.
  */
-function nestedScripts(words: string[]): string[] {
+export function nestedScripts(words: string[]): string[] {
 	const [name, ...args] = commandWords(words);
 	if (!name) return [];
 	if (name === "eval") return args.length > 0 ? [args.join(" ")] : [];
@@ -557,6 +578,35 @@ function segmentTargets(seg: Segment): string[] {
 			const files = args.filter((a, i) => !a.startsWith("-") && !scripts.has(i));
 			add(hasScriptFlag || name === "perl" ? files : files.slice(1));
 		}
+	} else if (name === "git") {
+		const positional = args.filter((a) => !a.startsWith("-"));
+		if (positional[0] === "clone" && positional.length >= 3) {
+			targets.push(positional[positional.length - 1]);
+		} else if (positional[0] === "worktree" && positional[1] === "add" && positional[2]) {
+			targets.push(positional[2]);
+		}
+	} else if (name === "find") {
+		// find's starting paths are its operands before the first test or action
+		const destructive = args.some(
+			(a) =>
+				a === "-delete" ||
+				a === "-exec" ||
+				a === "-execdir" ||
+				a === "-ok" ||
+				a === "-okdir" ||
+				/^-(?:fprint|fprint0|fprintf|fls)$/.test(a),
+		);
+		if (destructive) {
+			// The starting paths come before the first expression; -H, -L, and -P are
+			// the only options find allows before them
+			const starts: string[] = [];
+			for (const a of args) {
+				if (a === "-H" || a === "-L" || a === "-P") continue;
+				if (a.startsWith("-")) break;
+				starts.push(a);
+			}
+			add(starts.length > 0 ? starts : ["."]);
+		}
 	} else if (name === "dd") {
 		for (const a of args) if (a.startsWith("of=")) targets.push(a.slice(3));
 	} else if (name === "curl") {
@@ -567,7 +617,83 @@ function segmentTargets(seg: Segment): string[] {
 	return targets;
 }
 
-/** Absolute paths a command appears to create, modify, or delete. */
+// ---------------------------------------------------------------------------
+// Executed scripts
+// ---------------------------------------------------------------------------
+
+/** Files a runner would execute. Anything else is a plain argument. */
+const SCRIPT_EXT = /\.(?:py|pyw|js|mjs|cjs|jsx|ts|mts|cts|tsx|sh|bash|zsh|rb|pl|lua|php)$/;
+const RUNNERS = new Set([
+	"python",
+	"python2",
+	"python3",
+	"node",
+	"nodejs",
+	"bash",
+	"sh",
+	"zsh",
+	"dash",
+	"deno",
+	"bun",
+	"perl",
+	"ruby",
+	"tsx",
+]);
+/** Flags whose value is code or a module, not a file */
+const INLINE_FLAG = /^-(?:c|e|m|p)$/;
+
+function looksLikePath(word: string): boolean {
+	return (
+		word.startsWith("./") || word.startsWith("../") || word.startsWith("/") || word.startsWith("~/")
+	);
+}
+
+/**
+ * Absolute paths a command appears to execute. Heuristic, like the write
+ * targets: an interpreter's file argument, any argument that names a script by
+ * extension, and a directly executed path. `cd` is followed, since a script is
+ * usually named relative to where the line will run.
+ */
+export function extractExecTargets(command: string, cwd: string, home: string): string[] {
+	const out = new Set<string>();
+	let dir = cwd;
+	for (const seg of splitSegments(stripInertHeredocs(command))) {
+		const [name, ...args] = commandWords(seg.words);
+		if (!name) continue;
+		if (name === "cd") {
+			const target = args[0];
+			if (target && !target.startsWith("-")) dir = resolvePathArg(target, dir, home) ?? dir;
+			continue;
+		}
+
+		// commandWords returns the command name without its directory, so scan the
+		// raw words for paths and script names as well
+		const candidates: string[] = [];
+		for (const word of seg.words) {
+			if (looksLikePath(word) || SCRIPT_EXT.test(word)) candidates.push(word);
+		}
+		if (RUNNERS.has(name) && !args.some((a) => INLINE_FLAG.test(a))) {
+			const first = args.find((a) => !a.startsWith("-"));
+			if (first) candidates.push(first);
+		}
+
+		for (const candidate of candidates) {
+			const abs = resolvePathArg(candidate, dir, home);
+			if (abs) out.add(abs);
+		}
+	}
+	return [...out];
+}
+
+/** The directory a `cd` argument moves to, or undefined when it cannot be resolved. */
+function cdTarget(args: string[], cwd: string, home: string): string | undefined {
+	const target = [...args].reverse().find((a) => a === "-" || !a.startsWith("-"));
+	if (target === undefined) return home;
+	if (target === "-") return undefined;
+	return resolvePathArg(target, cwd, home);
+}
+
+/** Absolute paths a command appears to create, modify, or delete. `cd` is followed. */
 export function extractWriteTargets(
 	command: string,
 	cwd: string,
@@ -575,16 +701,46 @@ export function extractWriteTargets(
 	depth = 0,
 ): string[] {
 	const out = new Set<string>();
+	let current = cwd;
 	for (const seg of splitSegments(command)) {
+		const [name, ...args] = commandWords(seg.words);
+		if (name === "cd") {
+			const abs = cdTarget(args, current, home);
+			if (abs) current = abs;
+			continue;
+		}
 		for (const raw of segmentTargets(seg)) {
-			const abs = resolvePathArg(raw, cwd, home);
+			const abs = resolvePathArg(raw, current, home);
 			if (abs && !IGNORED_TARGETS.has(abs)) out.add(abs);
 		}
 		if (depth < MAX_NESTING) {
 			for (const script of nestedScripts(seg.words)) {
-				for (const target of extractWriteTargets(script, cwd, home, depth + 1)) out.add(target);
+				for (const target of extractWriteTargets(script, current, home, depth + 1)) {
+					out.add(target);
+				}
 			}
 		}
 	}
 	return [...out];
+}
+
+/** Absolute directories the command changes into, in order. */
+export function extractCdTargets(command: string, cwd: string, home: string): string[] {
+	const out: string[] = [];
+	let current = cwd;
+	for (const seg of splitSegments(command)) {
+		const [name, ...args] = commandWords(seg.words);
+		if (name !== "cd") continue;
+		const abs = cdTarget(args, current, home);
+		if (abs) {
+			out.push(abs);
+			current = abs;
+		}
+	}
+	return out;
+}
+
+/** The words of each simple command, with wrappers stripped by commandWords. */
+export function commandSegments(command: string): string[][] {
+	return splitSegments(command).map((seg) => seg.words);
 }

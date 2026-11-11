@@ -22,8 +22,9 @@ test("pi's real extension loader loads the directory extension and registers its
 	assert.deepEqual(result.errors, []);
 	const ext = result.extensions.find((e) => e.path.includes("command-guard"));
 	assert.ok(ext, "extension loaded");
-	for (const event of ["tool_call", "message_end", "agent_end", "session_start"]) {
+	for (const event of ["tool_call", "session_start", "message_end", "agent_end"]) {
 		assert.ok(ext.handlers.has(event), event);
 	}
 	assert.ok(ext.commands.has("permissions"), "/permissions is registered");
+	assert.ok(ext.commands.has("guard"), "/guard is registered");
 });

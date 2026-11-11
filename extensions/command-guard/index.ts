@@ -1,31 +1,18 @@
 /**
  * Command Guard Extension
  *
- * Guards the bash, write, and edit tools in layers:
+ * Guards bash, write, edit, and read with one stateless policy:
  *
- *   1. Static rules: regex, host, and path tripwires (shipped set plus yours)
- *   2. A strict allowlist fast path for plain read-only commands
- *   3. An optional decision model (a classifier) that judges calls the rules
- *      flag with action "judge", and optionally every unmatched bash call
- *   4. The human, via a confirm dialog, whenever the outcome is "confirm"
+ *   - read-only and unclassified commands run
+ *   - workspace, scratch, and configured-root mutations run
+ *   - everything outside those roots, plus network sends, privilege,
+ *     persistence, package installs, and destructive git, asks the human
+ *   - a small floor is blocked outright
  *
- * The human can switch the whole guard off for a session with `/permissions yolo`
- * (see modes.ts); `/permissions default` turns it back on.
- *
- * Config files (both optional, merged; the project file can only tighten):
- *   ~/.pi/agent/command-guard.json   global
- *   .pi/command-guard.json           project-local
- *
- * See README.md in this directory for the config schema. Reload with /reload
- * after changing it.
- *
- * === IMPORTANT: AI AGENT BEHAVIOR ===
- *
- * When the human is asked to confirm, the AI does not see the dialog. If the
- * user denies, the AI receives an error result stating that the user declined.
- * That result must be unambiguous: without it the AI cannot tell a refusal
- * from a platform failure, and may retry or rephrase the action to get around
- * a rule the user already rejected. Blocks are worded the same way.
+ * An optional classifier model can tighten opaque code or suppress an ask
+ * when the task clearly requests the effect. There is no approval memory and no
+ * project config. The global file is `~/.pi/agent/command-guard.json`; see
+ * README.md.
  */
 
 import { realpathSync } from "node:fs";
@@ -33,37 +20,30 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { buildPolicy, loadConfigFile, type Policy } from "./config.ts";
 import { createGuard } from "./guard.ts";
-import { type ClassifyFn, createJudge } from "./judge.ts";
+import { type ClassifyFn, createModel, type GuardModel } from "./model.ts";
 import {
 	DEFAULT_MODE,
-	enforcedPolicy,
 	getMode,
 	MODE_ENTRY_TYPE,
 	PERMISSION_MODES,
 	type PermissionMode,
 	restoreMode,
 } from "./modes.ts";
-import { AUDIT_ENTRY_TYPE, createTrace } from "./trace.ts";
+import { buildPolicy, loadConfigFile } from "./policy.ts";
 import { createTurnBuffer } from "./turn-buffer.ts";
-import { type GuardRule, isTraceLevel, TOOL_NAMES, TRACE_LEVELS } from "./types.ts";
+import { type Policy, TOOL_NAMES } from "./types.ts";
 
-/**
- * Set to "1" by the subagent extension in the pi processes it starts. Their only
- * "user" message is a task written by another model, so it cannot show what the
- * user authorized.
- */
-const DELEGATED_ENV = "PI_GOODIES_SUBAGENT";
+/** Session entry type the guard records decisions under. */
+const AUDIT_ENTRY_TYPE = "command-guard";
 
 const STATUS_KEY = "command-guard";
 
-function escapeRegExp(text: string): string {
-	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
+/** Set by the subagent extension: its only "user" message is another model's task. */
+const DELEGATED_ENV = "PI_GOODIES_SUBAGENT";
 
 /** The extension protects its own source, wherever it is installed. */
-function selfProtectionRule(): GuardRule {
+function guardDirs(): string[] {
 	const here = dirname(fileURLToPath(import.meta.url));
 	let real = here;
 	try {
@@ -71,96 +51,89 @@ function selfProtectionRule(): GuardRule {
 	} catch {
 		// keep the unresolved path
 	}
-	const dirs = [...new Set([here, real])];
-	return {
-		id: "protect-guard-extension",
-		category: "protected",
-		label: "command-guard's own source files",
-		paths: dirs.map((dir) => `^${escapeRegExp(dir)}/`),
-	};
+	return [...new Set([here, real])];
 }
 
 export default function (pi: ExtensionAPI) {
 	const home = process.env.HOME || homedir();
 	const globalPath = join(home, ".pi", "agent", "command-guard.json");
-	const selfProtection = selfProtectionRule();
+	const protectedDirs = guardDirs();
 	const turnBuffer = createTurnBuffer();
-	const trace = createTrace();
 	const delegated = process.env[DELEGATED_ENV] === "1";
-
-	/** The context of the latest tool call; the decision model is reached through it */
-	let latestCtx: ExtensionContext | undefined;
 
 	/** The permission mode of this session. Set by /permissions; never by config or the model */
 	let mode: PermissionMode = DEFAULT_MODE;
 
-	interface Base {
-		policy: Policy;
-		judge?: ReturnType<typeof createJudge>;
-	}
-
-	// Policies are built per working directory and cached until /reload; guards
-	// are cached per mode as well, since a mode may change the enforced policy
-	const bases = new Map<string, Base>();
+	const policies = new Map<string, Policy>();
 	const guards = new Map<string, ReturnType<typeof createGuard>>();
 
-	function baseFor(cwd: string, ctx: ExtensionContext): Base {
-		const cached = bases.get(cwd);
+	function policyFor(cwd: string, ctx: ExtensionContext): Policy {
+		const cached = policies.get(cwd);
 		if (cached) return cached;
 
 		const warnings: string[] = [];
-		const global = loadConfigFile(globalPath, warnings);
-		const project = loadConfigFile(join(cwd, ".pi", "command-guard.json"), warnings);
-		const policy = buildPolicy({ global, project }, { extraRules: [selfProtection] });
-		warnings.push(...policy.warnings);
-
-		let judge: ReturnType<typeof createJudge> | undefined;
-		if (policy.judge) {
-			const [provider, ...rest] = policy.judge.model.split("/");
+		const config = loadConfigFile(globalPath, warnings);
+		const policy = buildPolicy({
+			config,
+			cwd,
+			home,
+			protectedDirs,
+			guardConfigPath: globalPath,
+		});
+		policy.warnings.unshift(...warnings);
+		if (policy.classifier) {
+			const [provider, ...rest] = policy.classifier.model.split("/");
 			const modelId = rest.join("/");
-			// Say so now rather than letting every judged call end in the onError outcome
-			if (!ctx.modelRegistry.findOfType("classifier", provider, modelId)) {
-				warnings.push(
-					`classifier model ${policy.judge.model} is not available; judged actions will take the onError outcome (${policy.judge.onError})`,
-				);
+			let available: unknown;
+			try {
+				available =
+					provider && modelId
+						? ctx.modelRegistry.findOfType("classifier", provider, modelId)
+						: undefined;
+			} catch {
+				available = undefined;
 			}
-			const classify: ClassifyFn = async (context, signal) => {
-				const registry = latestCtx?.modelRegistry;
-				const model = registry?.findOfType("classifier", provider, modelId);
-				if (!registry || !model) {
-					throw new Error(`classifier model ${policy.judge?.model} is not available`);
-				}
-				return registry.classify(model, context, { signal });
-			};
-			judge = createJudge(classify, policy.judge);
+			if (!available) {
+				policy.warnings.push(
+					`classifier model ${policy.classifier.model} is not available; static policy only`,
+				);
+				policy.classifier = undefined;
+			}
 		}
 
-		for (const warning of warnings) {
+		for (const warning of policy.warnings) {
 			if (ctx.hasUI) ctx.ui.notify(`command-guard: ${warning}`, "warning");
 			else console.error(`[command-guard] ${warning}`);
 		}
-
-		const base = { policy, judge };
-		bases.set(cwd, base);
-		return base;
+		policies.set(cwd, policy);
+		return policy;
 	}
 
 	function guardFor(cwd: string, ctx: ExtensionContext) {
-		const key = `${mode.name}\0${cwd}`;
-		const cached = guards.get(key);
+		const cached = guards.get(cwd);
 		if (cached) return cached;
-
-		const { policy, judge } = baseFor(cwd, ctx);
+		const policy = policyFor(cwd, ctx);
+		let model: GuardModel | undefined;
+		if (policy.classifier) {
+			const settings = policy.classifier;
+			const [provider, ...rest] = settings.model.split("/");
+			const modelId = rest.join("/");
+			const classify: ClassifyFn = async (context, signal) => {
+				const registry = ctx.modelRegistry;
+				const available = registry.findOfType("classifier", provider, modelId);
+				if (!available) throw new Error(`classifier model ${settings.model} is not available`);
+				return registry.classify(available, context, { signal });
+			};
+			model = createModel(classify, settings);
+		}
 		const guard = createGuard({
-			policy: enforcedPolicy(mode, policy),
-			home,
-			turnBuffer,
-			delegated,
-			judge,
+			policy,
 			audit: (entry) => pi.appendEntry(AUDIT_ENTRY_TYPE, entry),
-			trace: (entry) => trace.record(entry),
+			model,
+			userMessages: () => turnBuffer.messages(),
+			delegated,
 		});
-		guards.set(key, guard);
+		guards.set(cwd, guard);
 		return guard;
 	}
 
@@ -208,49 +181,39 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerToolRenderer(trace.resolver);
-
-	const TRACE_DESCRIPTIONS: Record<(typeof TRACE_LEVELS)[number], string> = {
-		off: "No note under approved calls",
-		scores: "Note under calls the decision model allowed or you approved after it flagged them",
-		all: "Also a note under calls that never reached the decision model",
-	};
-
-	pi.registerCommand("guard-scores", {
-		description: `Show how approved calls were decided, under each call (${TRACE_LEVELS.join(", ")})`,
-		getArgumentCompletions: (prefix) => {
-			const matches = TRACE_LEVELS.filter((level) => level.startsWith(prefix.trim().toLowerCase()));
-			return matches.length > 0
-				? matches.map((level) => ({
-						value: level,
-						label: level,
-						description: TRACE_DESCRIPTIONS[level],
-					}))
-				: null;
-		},
-		handler: async (args, ctx) => {
-			const requested = args.trim().toLowerCase();
-			if (!requested) {
-				const lines = TRACE_LEVELS.map(
-					(level) => `${level === trace.level ? "*" : " "} ${level}: ${TRACE_DESCRIPTIONS[level]}`,
-				);
-				ctx.ui.notify(`Approved-call notes: ${trace.level}\n${lines.join("\n")}`, "info");
+	pi.registerCommand("guard", {
+		description: "Show the current command-guard policy",
+		handler: async (_args, ctx) => {
+			let policy: Policy;
+			try {
+				policy = policyFor(ctx.cwd, ctx);
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				ctx.ui.notify(`command-guard: the policy could not be built (${message})`, "error");
 				return;
 			}
-			if (!isTraceLevel(requested)) {
-				ctx.ui.notify(`Unknown level "${requested}". Levels: ${TRACE_LEVELS.join(", ")}`, "error");
-				return;
-			}
-			trace.setLevel(requested);
-			ctx.ui.notify(`Approved-call notes: ${requested}`, "info");
+			const roots = policy.writeRoots.length > 0 ? policy.writeRoots.join(", ") : "none";
+			const classifier = policy.classifier
+				? `${policy.classifier.model} (opaque risk ${policy.classifier.opaqueRisk.enabled ? `${policy.classifier.opaqueRisk.ask}/${policy.classifier.opaqueRisk.block}` : "off"}, scope ${policy.classifier.scope.enabled ? policy.classifier.scope.threshold : "off"})`
+				: "off";
+			const lines = [
+				`Permission mode: ${mode.name}`,
+				`Workspace: ${policy.workspace}${policy.workspaceWritable ? "" : " (not writable)"}`,
+				`Write roots: ${roots}`,
+				`Fetch hosts: ${policy.fetchHosts.join(", ")}`,
+				`Classifier: ${classifier}`,
+				`Protected: ${policy.protectedDirs.join(", ")}`,
+				`Config: ${policy.guardConfigPath}`,
+			];
+			ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});
 
 	pi.on("session_start", (event, ctx) => {
+		// A new session may have a different config on disk
+		policies.clear();
+		guards.clear();
 		turnBuffer.reset();
-		// The starting level is the configured one; /guard-scores changes it for this session
-		trace.setLevel(loadConfigFile(globalPath, [])?.display?.approved ?? "off");
-		trace.load(ctx.sessionManager.getBranch());
 		// Only a reload keeps the mode, since it re-runs this module in the same session.
 		// A resumed or forked session file is not trusted to switch the guard off, and
 		// without a UI nobody would see that it is off
@@ -275,7 +238,6 @@ export default function (pi: ExtensionAPI) {
 		if (!(TOOL_NAMES as readonly string[]).includes(event.toolName)) return undefined;
 		// The human switched the guard off: no part of it may run, so nothing in it can block
 		if (mode.bypass) return undefined;
-		latestCtx = ctx;
 
 		let guard: ReturnType<typeof createGuard>;
 		try {
